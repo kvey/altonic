@@ -14,7 +14,6 @@ pub mod expr;
 pub mod generators;
 pub mod json;
 pub mod pg;
-pub mod regex;
 pub mod rng;
 pub mod scan;
 pub mod schema;

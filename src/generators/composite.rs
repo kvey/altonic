@@ -7,15 +7,15 @@
 //! fragments map equally everywhere, including outside composites. A
 //! non-consistent sub-generator derives its stream from the parent cell's RNG.
 
-use super::{BuiltGenerator, CellCtx, Generator, Opts};
+use super::{compile, BuiltGenerator, CellCtx, Generator, Opts};
 use crate::crypto;
 use crate::expr::Expr;
 use crate::json::Json;
-use crate::regex::Regex;
 use crate::rng::Rng;
 use crate::schema::{Column, Table};
 use crate::value::Value;
 use crate::{verr, Result};
+use regex::Regex;
 
 fn run_sub(
     sub: &BuiltGenerator,
@@ -60,37 +60,34 @@ impl Generator for RegexMask {
             Value::Text(s) => s.clone(),
             other => other.to_string(),
         };
-        let chars: Vec<char> = s.chars().collect();
-        let matches = self.regex.find_iter_chars(&chars);
-        if matches.is_empty() {
-            return Ok(Value::Text(s));
-        }
-        // Collect replacement spans (start, end, new text), then splice.
+        // Collect replacement spans (byte offsets into `s`), then splice.
         let mut spans: Vec<(usize, usize, String)> = Vec::new();
-        for m in &matches {
+        for caps in self.regex.captures_iter(&s) {
             let mut claimed: Vec<(usize, usize)> = Vec::new();
             for (gi, sub) in &self.groups {
-                if let Some(Some((gs, ge))) = m.groups.get(*gi) {
-                    // Skip zero-width and overlapping (nested) group spans.
-                    if gs >= ge || claimed.iter().any(|(cs, ce)| gs < ce && cs < ge) {
-                        continue;
-                    }
-                    let fragment: String = chars[*gs..*ge].iter().collect();
-                    let out = run_sub(sub, &Value::Text(fragment), ctx, rng)?;
-                    spans.push((*gs, *ge, out.to_string()));
-                    claimed.push((*gs, *ge));
+                let Some(g) = caps.get(*gi) else { continue };
+                let (gs, ge) = (g.start(), g.end());
+                // Skip zero-width and overlapping (nested) group spans.
+                if gs >= ge || claimed.iter().any(|(cs, ce)| gs < *ce && *cs < ge) {
+                    continue;
                 }
+                let out = run_sub(sub, &Value::Text(g.as_str().to_string()), ctx, rng)?;
+                spans.push((gs, ge, out.to_string()));
+                claimed.push((gs, ge));
             }
         }
-        spans.sort_by_key(|(s, _, _)| *s);
+        if spans.is_empty() {
+            return Ok(Value::Text(s));
+        }
+        spans.sort_by_key(|(start, _, _)| *start);
         let mut out = String::new();
         let mut pos = 0;
         for (gs, ge, text) in spans {
-            out.extend(chars[pos..gs].iter());
+            out.push_str(&s[pos..gs]);
             out.push_str(&text);
             pos = ge;
         }
-        out.extend(chars[pos..].iter());
+        out.push_str(&s[pos..]);
         Ok(Value::Text(out))
     }
 }
@@ -100,8 +97,9 @@ pub fn regex_mask(opts: &Opts, table: &Table, column: &Column) -> Result<Box<dyn
     let pattern = opts
         .str("pattern")?
         .ok_or_else(|| verr("generator \"regex_mask\": option \"pattern\" is required"))?;
-    let regex = Regex::new(pattern)?;
-    if regex.group_count == 0 {
+    let regex = compile("regex_mask", pattern)?;
+    let group_count = regex.captures_len() - 1;
+    if group_count == 0 {
         return Err(verr("generator \"regex_mask\": pattern must have at least one capture group"));
     }
     let groups_json = opts
@@ -113,10 +111,9 @@ pub fn regex_mask(opts: &Opts, table: &Table, column: &Column) -> Result<Box<dyn
         let gi: usize = k
             .parse()
             .map_err(|_| verr(format!("generator \"regex_mask\": group key {k:?} must be a number")))?;
-        if gi == 0 || gi > regex.group_count {
+        if gi == 0 || gi > group_count {
             return Err(verr(format!(
-                "generator \"regex_mask\": group {gi} out of range (pattern has {} groups)",
-                regex.group_count
+                "generator \"regex_mask\": group {gi} out of range (pattern has {group_count} groups)"
             )));
         }
         let sub = super::build_sub(spec, table, column)?;
@@ -338,6 +335,21 @@ pub fn conditional(opts: &Opts, table: &Table, column: &Column) -> Result<Box<dy
 mod tests {
     use super::super::test_util::*;
     use crate::value::Value;
+
+    #[test]
+    /// Group spans are byte offsets into the cell, so a multi-byte character
+    /// before or inside a group must not shift the splice.
+    fn regex_mask_multibyte_text() {
+        let v = quick(
+            "regex_mask",
+            r#"{
+              "pattern": "café=(\\w+)…(\\w+)",
+              "groups": {"2": {"generator": "constant", "options": {"value": "ZZ"}}}
+            }"#,
+            "naïve café=señor…hünter tail—é",
+        );
+        assert_eq!(v.as_text().unwrap(), "naïve café=señor…ZZ tail—é");
+    }
 
     #[test]
     fn regex_mask_replaces_groups_only() {

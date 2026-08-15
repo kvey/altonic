@@ -1,10 +1,16 @@
-//! Minimal JSON (RFC 8259) parser and serializer.
+//! The value tree configs, schemas and reports are built from.
 //!
 //! Objects preserve member insertion order (Vec-backed) so reports and
-//! rewritten configs are stable. Numbers are kept as i64 when exactly
-//! integral, f64 otherwise.
+//! rewritten configs are stable — which is why this is its own type rather
+//! than `serde_json::Value`. Numbers are kept as i64 when exactly integral,
+//! f64 otherwise. Parsing and serialization are `serde`'s; implementing
+//! `Serialize`/`Deserialize` here is also what lets the TOML front-end reuse
+//! the same tree.
 
-use std::fmt::Write as _;
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {
@@ -21,6 +27,13 @@ impl Json {
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Object(members) => members.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Json> {
+        match self {
+            Json::Object(members) => members.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
@@ -87,356 +100,126 @@ impl Json {
     }
 
     pub fn parse(input: &str) -> Result<Json, String> {
-        let mut p = Parser { chars: input.chars().collect(), pos: 0 };
-        p.skip_ws();
-        let v = p.value(0)?;
-        p.skip_ws();
-        if p.pos != p.chars.len() {
-            return Err(p.err("trailing content after JSON value"));
-        }
-        Ok(v)
+        serde_json::from_str(input).map_err(|e| e.to_string())
     }
 
     pub fn to_string_pretty(&self) -> String {
-        let mut out = String::new();
-        self.write(&mut out, Some(0));
+        let mut out = serde_json::to_string_pretty(self).expect("Json always serializes");
         out.push('\n');
         out
     }
 
     pub fn to_string_compact(&self) -> String {
-        let mut out = String::new();
-        self.write(&mut out, None);
-        out
+        serde_json::to_string(self).expect("Json always serializes")
     }
+}
 
-    fn write(&self, out: &mut String, indent: Option<usize>) {
+impl Serialize for Json {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
-            Json::Null => out.push_str("null"),
-            Json::Bool(true) => out.push_str("true"),
-            Json::Bool(false) => out.push_str("false"),
-            Json::Int(i) => {
-                let _ = write!(out, "{i}");
-            }
-            Json::Float(f) => {
-                if f.is_finite() {
-                    if f.fract() == 0.0 && f.abs() < 1e15 {
-                        let _ = write!(out, "{:.1}", f);
-                    } else {
-                        let _ = write!(out, "{f}");
-                    }
-                } else {
-                    out.push_str("null"); // JSON has no NaN/Inf
-                }
-            }
-            Json::Str(s) => write_escaped(out, s),
+            Json::Null => s.serialize_unit(),
+            Json::Bool(b) => s.serialize_bool(*b),
+            Json::Int(i) => s.serialize_i64(*i),
+            // JSON has no NaN or Infinity.
+            Json::Float(f) if !f.is_finite() => s.serialize_unit(),
+            Json::Float(f) => s.serialize_f64(*f),
+            Json::Str(v) => s.serialize_str(v),
             Json::Array(items) => {
-                if items.is_empty() {
-                    out.push_str("[]");
-                    return;
+                let mut seq = s.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
                 }
-                out.push('[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    if let Some(level) = indent {
-                        newline_indent(out, level + 1);
-                        item.write(out, Some(level + 1));
-                    } else {
-                        item.write(out, None);
-                    }
-                }
-                if let Some(level) = indent {
-                    newline_indent(out, level);
-                }
-                out.push(']');
+                seq.end()
             }
             Json::Object(members) => {
-                if members.is_empty() {
-                    out.push_str("{}");
-                    return;
+                let mut map = s.serialize_map(Some(members.len()))?;
+                for (k, v) in members {
+                    map.serialize_entry(k, v)?;
                 }
-                out.push('{');
-                for (i, (k, v)) in members.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    if let Some(level) = indent {
-                        newline_indent(out, level + 1);
-                        write_escaped(out, k);
-                        out.push_str(": ");
-                        v.write(out, Some(level + 1));
-                    } else {
-                        write_escaped(out, k);
-                        out.push(':');
-                        v.write(out, None);
-                    }
-                }
-                if let Some(level) = indent {
-                    newline_indent(out, level);
-                }
-                out.push('}');
+                map.end()
             }
         }
     }
 }
 
-fn newline_indent(out: &mut String, level: usize) {
-    out.push('\n');
-    for _ in 0..level {
-        out.push_str("  ");
+impl<'de> Deserialize<'de> for Json {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Json, D::Error> {
+        d.deserialize_any(JsonVisitor)
     }
 }
 
-fn write_escaped(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
+/// TOML surfaces datetimes to an untyped visitor as a map under this reserved
+/// key. altonic has no datetime-typed config fields, and silently turning one
+/// into an object would be worse than saying so.
+const TOML_DATETIME_KEY: &str = "$__toml_private_datetime";
 
-const MAX_DEPTH: usize = 128;
+struct JsonVisitor;
 
-struct Parser {
-    chars: Vec<char>,
-    pos: usize,
-}
+impl<'de> Visitor<'de> for JsonVisitor {
+    type Value = Json;
 
-impl Parser {
-    fn err(&self, msg: &str) -> String {
-        // Report 1-based line:col of the current position.
-        let mut line = 1;
-        let mut col = 1;
-        for &c in self.chars.iter().take(self.pos) {
-            if c == '\n' {
-                line += 1;
-                col = 1;
-            } else {
-                col += 1;
-            }
-        }
-        format!("{msg} at line {line}, column {col}")
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any value")
     }
 
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+    fn visit_unit<E>(self) -> Result<Json, E> {
+        Ok(Json::Null)
     }
 
-    fn bump(&mut self) -> Option<char> {
-        let c = self.peek();
-        if c.is_some() {
-            self.pos += 1;
-        }
-        c
+    fn visit_none<E>(self) -> Result<Json, E> {
+        Ok(Json::Null)
     }
 
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r')) {
-            self.pos += 1;
-        }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Json, D::Error> {
+        d.deserialize_any(self)
     }
 
-    fn expect(&mut self, c: char) -> Result<(), String> {
-        if self.bump() == Some(c) {
-            Ok(())
-        } else {
-            self.pos = self.pos.saturating_sub(1);
-            Err(self.err(&format!("expected '{c}'")))
-        }
+    fn visit_bool<E>(self, v: bool) -> Result<Json, E> {
+        Ok(Json::Bool(v))
     }
 
-    fn value(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > MAX_DEPTH {
-            return Err(self.err("nesting too deep"));
-        }
-        match self.peek() {
-            Some('{') => self.object(depth),
-            Some('[') => self.array(depth),
-            Some('"') => Ok(Json::Str(self.string()?)),
-            Some('t') => self.literal("true", Json::Bool(true)),
-            Some('f') => self.literal("false", Json::Bool(false)),
-            Some('n') => self.literal("null", Json::Null),
-            Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
-            Some(_) => Err(self.err("unexpected character")),
-            None => Err(self.err("unexpected end of input")),
-        }
+    fn visit_i64<E>(self, v: i64) -> Result<Json, E> {
+        Ok(Json::Int(v))
     }
 
-    fn literal(&mut self, word: &str, val: Json) -> Result<Json, String> {
-        for expected in word.chars() {
-            if self.bump() != Some(expected) {
-                return Err(self.err(&format!("invalid literal, expected '{word}'")));
-            }
-        }
-        Ok(val)
+    fn visit_u64<E>(self, v: u64) -> Result<Json, E> {
+        Ok(match i64::try_from(v) {
+            Ok(i) => Json::Int(i),
+            Err(_) => Json::Float(v as f64),
+        })
     }
 
-    fn object(&mut self, depth: usize) -> Result<Json, String> {
-        self.expect('{')?;
-        let mut members = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some('}') {
-            self.pos += 1;
-            return Ok(Json::Object(members));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.string()?;
-            self.skip_ws();
-            self.expect(':')?;
-            self.skip_ws();
-            let val = self.value(depth + 1)?;
-            members.push((key, val));
-            self.skip_ws();
-            match self.bump() {
-                Some(',') => continue,
-                Some('}') => return Ok(Json::Object(members)),
-                _ => {
-                    self.pos = self.pos.saturating_sub(1);
-                    return Err(self.err("expected ',' or '}' in object"));
-                }
-            }
-        }
+    fn visit_f64<E>(self, v: f64) -> Result<Json, E> {
+        Ok(Json::Float(v))
     }
 
-    fn array(&mut self, depth: usize) -> Result<Json, String> {
-        self.expect('[')?;
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(']') {
-            self.pos += 1;
-            return Ok(Json::Array(items));
-        }
-        loop {
-            self.skip_ws();
-            items.push(self.value(depth + 1)?);
-            self.skip_ws();
-            match self.bump() {
-                Some(',') => continue,
-                Some(']') => return Ok(Json::Array(items)),
-                _ => {
-                    self.pos = self.pos.saturating_sub(1);
-                    return Err(self.err("expected ',' or ']' in array"));
-                }
-            }
-        }
+    fn visit_str<E>(self, v: &str) -> Result<Json, E> {
+        Ok(Json::Str(v.to_string()))
     }
 
-    fn string(&mut self) -> Result<String, String> {
-        self.expect('"')?;
-        let mut s = String::new();
-        loop {
-            match self.bump() {
-                None => return Err(self.err("unterminated string")),
-                Some('"') => return Ok(s),
-                Some('\\') => match self.bump() {
-                    Some('"') => s.push('"'),
-                    Some('\\') => s.push('\\'),
-                    Some('/') => s.push('/'),
-                    Some('b') => s.push('\u{08}'),
-                    Some('f') => s.push('\u{0c}'),
-                    Some('n') => s.push('\n'),
-                    Some('r') => s.push('\r'),
-                    Some('t') => s.push('\t'),
-                    Some('u') => {
-                        let hi = self.hex4()?;
-                        let cp = if (0xd800..0xdc00).contains(&hi) {
-                            // Surrogate pair
-                            if self.bump() != Some('\\') || self.bump() != Some('u') {
-                                return Err(self.err("unpaired surrogate"));
-                            }
-                            let lo = self.hex4()?;
-                            if !(0xdc00..0xe000).contains(&lo) {
-                                return Err(self.err("invalid low surrogate"));
-                            }
-                            0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)
-                        } else if (0xdc00..0xe000).contains(&hi) {
-                            return Err(self.err("unpaired low surrogate"));
-                        } else {
-                            hi
-                        };
-                        s.push(char::from_u32(cp).ok_or_else(|| self.err("invalid codepoint"))?);
-                    }
-                    _ => return Err(self.err("invalid escape")),
-                },
-                Some(c) if (c as u32) < 0x20 => return Err(self.err("control character in string")),
-                Some(c) => s.push(c),
-            }
-        }
+    fn visit_string<E>(self, v: String) -> Result<Json, E> {
+        Ok(Json::Str(v))
     }
 
-    fn hex4(&mut self) -> Result<u32, String> {
-        let mut v = 0u32;
-        for _ in 0..4 {
-            let c = self.bump().ok_or_else(|| self.err("truncated \\u escape"))?;
-            let d = c.to_digit(16).ok_or_else(|| self.err("invalid hex digit"))?;
-            v = v * 16 + d;
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(item) = seq.next_element()? {
+            items.push(item);
         }
-        Ok(v)
+        Ok(Json::Array(items))
     }
 
-    fn number(&mut self) -> Result<Json, String> {
-        let start = self.pos;
-        if self.peek() == Some('-') {
-            self.pos += 1;
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
+        let mut members: Vec<(String, Json)> = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        while let Some(key) = map.next_key::<String>()? {
+            if key == TOML_DATETIME_KEY {
+                return Err(serde::de::Error::custom(
+                    "datetime values are not supported; quote them as strings",
+                ));
+            }
+            members.push((key, map.next_value()?));
         }
-        // int part
-        match self.peek() {
-            Some('0') => {
-                self.pos += 1;
-            }
-            Some(c) if c.is_ascii_digit() => {
-                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                    self.pos += 1;
-                }
-            }
-            _ => return Err(self.err("invalid number")),
-        }
-        let mut is_float = false;
-        if self.peek() == Some('.') {
-            is_float = true;
-            self.pos += 1;
-            if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                return Err(self.err("digit required after decimal point"));
-            }
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some('e' | 'E')) {
-            is_float = true;
-            self.pos += 1;
-            if matches!(self.peek(), Some('+' | '-')) {
-                self.pos += 1;
-            }
-            if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                return Err(self.err("digit required in exponent"));
-            }
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                self.pos += 1;
-            }
-        }
-        let text: String = self.chars[start..self.pos].iter().collect();
-        if !is_float {
-            if let Ok(i) = text.parse::<i64>() {
-                return Ok(Json::Int(i));
-            }
-        }
-        text.parse::<f64>().map(Json::Float).map_err(|_| self.err("invalid number"))
+        Ok(Json::Object(members))
     }
 }
 
@@ -476,5 +259,21 @@ mod tests {
         assert_eq!(Json::parse("9223372036854775807").unwrap().as_i64(), Some(i64::MAX));
         assert_eq!(Json::parse("-1e3").unwrap().as_f64(), Some(-1000.0));
         assert_eq!(Json::parse("0.5").unwrap().as_f64(), Some(0.5));
+        // Beyond i64 stays representable as a float rather than failing.
+        assert!(Json::parse("18446744073709551615").unwrap().as_f64().is_some());
+    }
+
+    #[test]
+    fn integral_floats_keep_their_point() {
+        // Distinguishes a Float from an Int on the way out, so a round trip
+        // through a report does not silently retype a column's value.
+        assert_eq!(Json::Float(3.0).to_string_compact(), "3.0");
+        assert_eq!(Json::Int(3).to_string_compact(), "3");
+    }
+
+    #[test]
+    fn non_finite_floats_become_null() {
+        assert_eq!(Json::Float(f64::NAN).to_string_compact(), "null");
+        assert_eq!(Json::Float(f64::INFINITY).to_string_compact(), "null");
     }
 }
