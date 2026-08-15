@@ -4,8 +4,9 @@
 //! Exit codes: 0 success, 1 validation error, 2 runtime error.
 
 use crate::config::{Config, TableMode};
-use crate::connector::{DirDataset, DirDestination, SourceConnector};
+use crate::connector::{DestinationConnector, DirDataset, DirDestination, SourceConnector};
 use crate::engine::{self, GenerateOptions};
+use crate::pg::{PgDestination, PgSource, PgUrl};
 use crate::scan;
 use crate::subset::{self, TableRole};
 use crate::{Error, Result};
@@ -14,15 +15,19 @@ use std::collections::HashMap;
 const USAGE: &str = "altonic — pure-Rust data cleaning, subsetting, and replication
 
 USAGE:
-  altonic init <dir>                        scaffold a demo dataset + config
-  altonic schema   --source <dir>           print the dataset schema
-  altonic scan     --source <dir> [--config <file>] [--sample N]
+  altonic init <dir>                          scaffold a demo dataset + config
+  altonic schema   --source <src>             print the source schema
+  altonic scan     --source <src> [--config <file>] [--sample N]
                    [--json] [--apply <file>] [--strict]
-  altonic subset   --source <dir> --config <file> [--json] [--verify]
-  altonic generate --source <dir> --dest <dir> --config <file>
+  altonic subset   --source <src> --config <file> [--json] [--verify]
+  altonic generate --source <src> --dest <dst> --config <file>
                    [--no-subset] [--dry-run] [--report <file>] [--json]
 
-A dataset directory holds schema.json plus one <table>.csv per table.
+<src>/<dst> are either dataset directories (schema.json + one CSV per
+table) or live Postgres URLs:
+  postgres://user:password@host:5432/dbname[?schema=public]
+Postgres replication preserves the source's exact column types, primary
+keys, unique constraints, and foreign keys in the destination database.
 See SPEC.md for the configuration format and generator catalog.";
 
 /// Entry point; returns the process exit code.
@@ -111,11 +116,29 @@ fn load_config(path: &str) -> Result<Config> {
     Config::parse(&text)
 }
 
+/// Open a source: a Postgres URL or a dataset directory.
+fn open_source(spec: &str) -> Result<Box<dyn SourceConnector>> {
+    if PgUrl::is_pg_url(spec) {
+        Ok(Box::new(PgSource::connect(spec)?))
+    } else {
+        Ok(Box::new(DirDataset::open(spec)?))
+    }
+}
+
+/// Open a destination: a Postgres URL or a dataset directory.
+fn open_dest(spec: &str) -> Result<Box<dyn DestinationConnector>> {
+    if PgUrl::is_pg_url(spec) {
+        Ok(Box::new(PgDestination::connect(spec)?))
+    } else {
+        Ok(Box::new(DirDestination::create(spec)?))
+    }
+}
+
 // ---------- schema ----------
 
 fn cmd_schema(args: &[String]) -> Result<()> {
     let f = parse_flags(args, &["source"], &[])?;
-    let ds = DirDataset::open(f.require("source")?)?;
+    let ds = open_source(f.require("source")?)?;
     for t in &ds.schema().tables {
         let rows = ds.count_rows(&t.name)?;
         println!("{}  ({} rows)", t.name, rows);
@@ -147,7 +170,7 @@ fn cmd_schema(args: &[String]) -> Result<()> {
 
 fn cmd_scan(args: &[String]) -> Result<()> {
     let f = parse_flags(args, &["source", "config", "sample", "apply"], &["json", "strict"])?;
-    let ds = DirDataset::open(f.require("source")?)?;
+    let ds = open_source(f.require("source")?)?;
     let config = match f.named.get("config") {
         Some(p) => Some(load_config(p)?),
         None => None,
@@ -156,7 +179,7 @@ fn cmd_scan(args: &[String]) -> Result<()> {
         Some(s) => s.parse().map_err(|_| crate::verr("--sample must be a number"))?,
         None => 1000,
     };
-    let report = scan::scan(&ds, config.as_ref(), sample)?;
+    let report = scan::scan(ds.as_ref(), config.as_ref(), sample)?;
 
     if f.has("json") {
         println!("{}", report.to_json().to_string_pretty());
@@ -234,15 +257,15 @@ fn fresh_secret() -> String {
 
 fn cmd_subset(args: &[String]) -> Result<()> {
     let f = parse_flags(args, &["source", "config"], &["json", "verify"])?;
-    let ds = DirDataset::open(f.require("source")?)?;
+    let ds = open_source(f.require("source")?)?;
     let config = load_config(f.require("config")?)?;
     let sc = config
         .subset
         .as_ref()
         .ok_or_else(|| crate::verr("config has no \"subset\" section"))?;
-    let result = subset::compute(&ds, sc, config.secret.as_bytes())?;
+    let result = subset::compute(ds.as_ref(), sc, config.secret.as_bytes())?;
     if f.has("verify") {
-        subset::verify_closure(&ds, &result)?;
+        subset::verify_closure(ds.as_ref(), &result)?;
     }
 
     let mut names: Vec<&String> = result.tables.keys().collect();
@@ -293,14 +316,14 @@ fn cmd_generate(args: &[String]) -> Result<()> {
     let source_path = f.require("source")?;
     let dest_path = f.require("dest")?;
     let config_path = f.require("config")?;
-    let ds = DirDataset::open(source_path)?;
+    let ds = open_source(source_path)?;
     let config = load_config(config_path)?;
-    let mut dest = DirDestination::create(dest_path)?;
+    let mut dest = open_dest(dest_path)?;
     let options = GenerateOptions {
         use_subset: !f.has("no-subset"),
         dry_run: f.has("dry-run"),
     };
-    let report = engine::generate(&ds, &mut dest, &config, &options)?;
+    let report = engine::generate(ds.as_ref(), dest.as_mut(), &config, &options)?;
 
     if f.has("json") {
         println!("{}", report.to_json().to_string_pretty());

@@ -306,6 +306,7 @@ pub(crate) fn build_sub(spec: &Json, table: &Table, parent_col: &Column) -> Resu
         ty: ColumnType::Text,
         nullable: true,
         unique: false,
+        db_type: None,
     };
     build(name, &options, table, &relaxed)
 }

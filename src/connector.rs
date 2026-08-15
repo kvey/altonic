@@ -37,6 +37,11 @@ pub trait DestinationConnector {
     /// Whether the destination already holds data for this table
     /// (drives `preserve_destination` mode).
     fn has_table_data(&self, table: &str) -> bool;
+    /// Called once after all tables are written; database destinations add
+    /// deferred constraints (foreign keys) here.
+    fn finalize(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait RowSink {

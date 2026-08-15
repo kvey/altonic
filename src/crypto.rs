@@ -151,6 +151,23 @@ pub fn hmac_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     hmac_sha256(key, &msg)
 }
 
+/// PBKDF2-HMAC-SHA256 (RFC 2898), single 32-byte block output — exactly the
+/// `Hi()` function SCRAM-SHA-256 needs (RFC 5802 §2.2).
+pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut block = Vec::with_capacity(salt.len() + 4);
+    block.extend_from_slice(salt);
+    block.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = hmac_sha256(password, &block);
+    let mut out = u;
+    for _ in 1..iterations {
+        u = hmac_sha256(password, &u);
+        for i in 0..32 {
+            out[i] ^= u[i];
+        }
+    }
+    out
+}
+
 pub fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -214,6 +231,25 @@ mod tests {
         assert_eq!(
             to_hex(&hmac_sha256(&key, b"Test Using Larger Than Block-Size Key - Hash Key First")),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_vector() {
+        // RFC 7677 SCRAM-SHA-256 test vector: SaltedPassword for password
+        // "pencil", salt base64 "W22ZaJ0SNY7soEsUEjb6gQ==", 4096 iterations.
+        let salt = [
+            0x5bu8, 0x6d, 0x99, 0x68, 0x9d, 0x12, 0x35, 0x8e, 0xec, 0xa0, 0x4b, 0x14, 0x12, 0x36,
+            0xfa, 0x81,
+        ];
+        let salted = pbkdf2_hmac_sha256(b"pencil", &salt, 4096);
+        // Derived: ClientKey = HMAC(salted, "Client Key"); StoredKey = SHA256(ClientKey)
+        // RFC 7677 gives StoredKey = WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = sha256(&client_key);
+        assert_eq!(
+            to_hex(&stored_key),
+            "586e5df283e6dceb5c3e791d8b8528ec191e664045ce971792e2e6b5bb13e2a6"
         );
     }
 

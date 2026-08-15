@@ -1,17 +1,35 @@
 # Altonic
 
-A pure-Rust database **data cleaning (de-identification), subsetting, and replication**
+A pure-Rust **Postgres data cleaning (de-identification), subsetting, and replication**
 tool — an open, from-first-principles re-implementation of the core ideas behind
-[Tonic Structural](https://www.tonic.ai/products/tonic-structural): take a production
-dataset, find the PII, replace it with realistic synthetic values, optionally shrink it
-to a coherent subset, and replicate the result — with schema, foreign keys, and
-statistical shape intact.
+[Tonic Structural](https://www.tonic.ai/products/tonic-structural): point it at a
+production Postgres database and it produces a replica of the **same shape** — exact
+column types, primary keys, unique constraints, foreign keys — with all identifying
+information stripped and replaced by realistic synthetic values, optionally shrunk to a
+small but referentially-closed subset.
 
-**Zero external dependencies.** JSON, CSV, regex, SHA-256/HMAC, and the deterministic
-PRNG are all implemented in this repository; `cargo build` needs only the Rust standard
-library. See [SPEC.md](SPEC.md) for the full specification.
+```console
+$ altonic generate \
+    --source postgres://app:...@prod-replica:5432/app \
+    --dest   postgres://app:...@dev-db:5432/app_masked \
+    --config workspace.json
+```
+
+**Zero external dependencies.** The Postgres wire protocol (SCRAM-SHA-256/MD5 auth,
+COPY streaming), JSON, CSV, regex, SHA-256/HMAC/PBKDF2, MD5, base64, and the
+deterministic PRNG are all implemented in this repository; `cargo build` needs only the
+Rust standard library. See [SPEC.md](SPEC.md) for the full specification.
 
 ## Highlights
+
+- **Live Postgres → Postgres replication, no libpq**: the frontend/backend protocol v3
+  is implemented from the spec — startup, cleartext/MD5/**SCRAM-SHA-256** auth (server
+  signature verified), simple queries, and `COPY TO STDOUT` / `COPY FROM STDIN`
+  text-format streaming. Schema introspection captures exact types
+  (`character varying(40)` stays `character varying(40)`), PKs, uniques, and
+  composite-correct FKs; the destination is rebuilt with the same DDL shape and FKs are
+  attached after load so table order never matters. Sources and destinations mix
+  freely: pg→pg, pg→directory snapshot, directory→pg.
 
 - **38 generators**: key masking (format-preserving integer/UUID/alphanumeric keys),
   realistic PII types (names, emails, phones, addresses, SSNs, Luhn-valid credit cards,
@@ -34,14 +52,33 @@ library. See [SPEC.md](SPEC.md) for the full specification.
   `(source, config, secret)` — reruns are byte-identical, and subset sampling is stable
   hash-based, not RNG-order-based.
 
-## Quick start
+## Quick start (Postgres)
 
 ```console
 $ cargo build --release
+$ export SRC="postgres://user:pass@localhost:5432/prod_copy"
+$ export DST="postgres://user:pass@localhost:5432/masked"
+$ target/release/altonic schema   --source "$SRC"                  # introspect
+$ target/release/altonic scan     --source "$SRC" --apply ws.json  # detect PII, write config
+$ target/release/altonic subset   --source "$SRC" --config ws.json --verify
+$ target/release/altonic generate --source "$SRC" --dest "$DST" --config ws.json
+```
+
+Verified against a live Postgres 16 with SCRAM auth: a 200-customer / 500-order /
+1200-item source replicates in ~1s with every `varchar(n)`/`char(n)`/`numeric`/`jsonb`/
+`timestamptz` column type preserved, PK/unique/FK constraints recreated, zero FK
+orphans, zero PII strings surviving (including inside `jsonb` via `json_mask`), and
+byte-identical reruns. With subsetting enabled the same run ships 20% of orders plus
+exactly the customers/items/lookups that keep the replica closed under foreign keys.
+
+Limitations (v1, documented in SPEC §7.2): plain-TCP connections only (no TLS), one
+schema per run, and sequences/identity defaults, secondary indexes, views, and triggers
+are not replicated.
+
+## Quick start (file datasets, no database needed)
+
+```console
 $ target/release/altonic init demo
-$ target/release/altonic schema   --source demo/source
-$ target/release/altonic scan     --source demo/source --config demo/altonic.json
-$ target/release/altonic subset   --source demo/source --config demo/altonic.json --verify
 $ target/release/altonic generate --source demo/source --dest demo/dest --config demo/altonic.json
 ```
 
@@ -102,6 +139,7 @@ and inherits its key mapping automatically. Columns sharing a `link` label (here
 | `src/json.rs`, `src/csv.rs`, `src/regex.rs`, `src/expr.rs` | RFC 8259 JSON, RFC 4180 CSV, a memoized backtracking regex VM, and the row-expression language |
 | `src/schema.rs`, `src/value.rs`, `src/config.rs` | Data model and workspace config |
 | `src/connector.rs` | Connector traits + directory dataset implementation |
+| `src/pg/` | Postgres: wire protocol, SCRAM/MD5 auth, COPY codec, introspection, connectors |
 | `src/generators/` | Generator trait, seeding discipline, and the full catalog |
 | `src/subset.rs` | Target/lookup/upstream subsetter with closure verification |
 | `src/scan.rs` | PII detection and recommendations |
@@ -111,8 +149,13 @@ and inherits its key mapping automatically. Columns sharing a `link` label (here
 ## Testing
 
 ```console
-$ cargo test        # 112 tests: crypto vectors, regex behavior, closure invariants,
-                    # FK-integrity end-to-end, byte-identical rerun checks, CLI workflow
+$ cargo test        # 127 tests: crypto vectors (SHA-256, HMAC, PBKDF2/SCRAM RFC 7677,
+                    # MD5, base64), regex behavior, COPY codec round-trips, closure
+                    # invariants, FK-integrity end-to-end, byte-identical rerun checks
+
+# Live Postgres integration (points at throwaway databases it may drop/recreate):
+$ ALTONIC_PG_TEST_SRC=postgres://u:p@localhost/src \
+  ALTONIC_PG_TEST_DST=postgres://u:p@localhost/dst cargo test --test pg
 ```
 
 ## Security notes

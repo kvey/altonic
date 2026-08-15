@@ -171,10 +171,12 @@ pub type Row = Vec<Value>;
 // ---------- Timestamp handling (first principles, proleptic Gregorian) ----------
 
 /// A parsed civil timestamp. Supports `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`,
-/// and `YYYY-MM-DDTHH:MM:SS`, with optional fractional seconds and optional
-/// trailing `Z`. Timezone offsets are not interpreted (values pass through
-/// unmodified if unparseable).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// and `YYYY-MM-DDTHH:MM:SS`, with optional fractional seconds and an
+/// optional trailing `Z` or numeric UTC offset (`+00`, `-05:30`, `+0000`) as
+/// Postgres `timestamptz` emits. The offset is preserved verbatim on render
+/// but not applied to the civil fields — Postgres connections are pinned to
+/// UTC (offset `+00`), so shift arithmetic stays correct.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Timestamp {
     pub year: i64,
     pub month: u32,
@@ -187,6 +189,8 @@ pub struct Timestamp {
     pub sep_t: bool,
     pub had_time: bool,
     pub had_z: bool,
+    /// Verbatim numeric offset suffix (e.g. "+00", "-05:30"), if present.
+    pub offset: Option<String>,
 }
 
 fn is_leap(y: i64) -> bool {
@@ -269,6 +273,7 @@ impl Timestamp {
             sep_t: false,
             had_time: false,
             had_z: false,
+            offset: None,
         };
         if b.len() == 10 {
             return Some(ts);
@@ -306,6 +311,21 @@ impl Timestamp {
         if i < b.len() && (b[i] == 'Z' || b[i] == 'z') {
             ts.had_z = true;
             i += 1;
+        } else if i < b.len() && (b[i] == '+' || b[i] == '-') {
+            // Numeric UTC offset: +HH, +HH:MM, +HHMM.
+            let start = i;
+            i += 1;
+            let mut digits = 0;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == ':') {
+                if b[i].is_ascii_digit() {
+                    digits += 1;
+                }
+                i += 1;
+            }
+            if digits != 2 && digits != 4 {
+                return None;
+            }
+            ts.offset = Some(b[start..i].iter().collect());
         }
         if i != b.len() {
             return None;
@@ -340,6 +360,7 @@ impl Timestamp {
             sep_t: like.sep_t,
             had_time: like.had_time,
             had_z: like.had_z,
+            offset: like.offset.clone(),
         }
     }
 
@@ -355,6 +376,8 @@ impl Timestamp {
             }
             if self.had_z {
                 s.push('Z');
+            } else if let Some(o) = &self.offset {
+                s.push_str(o);
             }
         }
         s
@@ -398,6 +421,8 @@ mod tests {
             "2024-01-15T10:30:00Z",
             "1969-12-31 23:59:59",
             "2024-01-15T10:30:00.123456",
+            "2024-01-15 10:30:00+00",
+            "2024-01-15 10:30:00.5-05:30",
         ] {
             let ts = Timestamp::parse(s).unwrap();
             assert_eq!(ts.render(), s, "round trip of {s}");

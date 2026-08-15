@@ -527,6 +527,11 @@ pub fn generate(
         }
         report.tables.push(tr);
     }
+    if !options.dry_run {
+        // Database destinations add deferred FK constraints here, after all
+        // tables (in any FK order) have their data.
+        dest.finalize()?;
+    }
     report.elapsed_ms = start.elapsed().as_millis();
     Ok(report)
 }

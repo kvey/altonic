@@ -101,13 +101,10 @@ users can bulk-apply.
 
 ### 2.2 Non-goals (v1)
 
-- Live database wire protocols. The v1 connector is a **directory dataset**
-  (`schema.json` + one CSV per table) — an interchange format every database can dump
-  to/load from. The connector boundary is a trait (`§7`), so Postgres/MySQL connectors are
-  additive work, not rework.
 - A web UI, workspace multi-tenancy, or Tonic's proprietary ML-based synthesis.
 - Differential-privacy accounting with formal ε budgets (we implement the mechanism
   hooks — noised categorical sampling — but do not claim formal guarantees).
+- TLS for database connections (§7.2 lists the exact Postgres feature envelope).
 
 ---
 
@@ -353,9 +350,49 @@ trait DestinationConnector {
 }
 ```
 
-v1 ships `DirDataset` implementing both over a directory of CSVs. The engine is written
-against the traits only. Re-openable streaming reads are required because subsetting and
-the analysis pass make multiple passes.
+Two connector pairs ship. The engine is written against the traits only; re-openable
+streaming reads are required because subsetting and the analysis pass make multiple
+passes. `DestinationConnector::finalize` runs once after all tables are written, for
+deferred constraints.
+
+### 7.1 Directory dataset
+
+`DirDataset` / `DirDestination` over a directory of CSVs plus `schema.json` — the
+portable interchange format, and the reference implementation for tests.
+
+### 7.2 Postgres (pure Rust, wire protocol from first principles)
+
+`PgSource` / `PgDestination` speak the Postgres frontend/backend protocol v3 directly
+over TCP — no libpq, no driver crate:
+
+- **Auth**: cleartext, `md5` (MD5 per RFC 1321, in-repo), and **SCRAM-SHA-256**
+  (RFC 5802/7677: PBKDF2-HMAC-SHA256, base64, nonces from `/dev/urandom`; the server
+  signature is verified). GSSAPI and TLS (hence `SCRAM-SHA-256-PLUS`) are out of scope;
+  URLs demanding `sslmode=require` are rejected rather than silently downgraded.
+- **Reads**: schema introspection via `information_schema` (tables, columns with
+  `format_type` exact types, PK/UNIQUE constraints, FKs with correct composite-key
+  pairing via `position_in_unique_constraint`), then `COPY … TO STDOUT` text-format
+  streaming — one dedicated connection per open row stream. Sessions are pinned to UTC
+  so `timestamptz` text is stable.
+- **Type mapping**: `int2/4/8→integer`, `float4/8/numeric→float`, `bool`, `uuid`,
+  `date`, `timestamp(tz)`, `json(b)`; everything else flows through as `text`
+  (maskable by any text generator). Each column also records its exact source type
+  (`db_type`, §3.2) so the replica keeps the original shape —
+  `character varying(40)` stays `character varying(40)`, not `text`.
+- **Writes**: per-table `DROP TABLE IF EXISTS … CASCADE` + `CREATE TABLE` using the
+  original types, `NOT NULL`, `PRIMARY KEY`, and single-column `UNIQUE` constraints;
+  data loads via `COPY … FROM STDIN`; **foreign keys are added in `finalize`** after
+  all tables have data, so table load order never matters. DDL runs lazily per table,
+  which is what makes `preserve_destination` leave existing tables untouched.
+- **Envelope (v1)**: one schema per run (`?schema=`, default `public`); sequences /
+  identity defaults, non-constraint indexes, views, triggers, extensions, and
+  multi-column UNIQUE constraints are not replicated (`serial` columns arrive as their
+  underlying int type). Exotic column types replicate by exact `db_type` and pass
+  through as text.
+
+URLs: `postgres://user:password@host:port/dbname[?schema=…&sslmode=disable]`; the
+password may come from `PGPASSWORD`. Live integration tests are gated on
+`ALTONIC_PG_TEST_SRC` / `ALTONIC_PG_TEST_DST`.
 
 ---
 
@@ -460,12 +497,15 @@ requires at least one capture group; group 0 rewriting is not supported.
 
 ```
 altonic init <dir>                       scaffold demo dataset + config
-altonic schema  --source <dir>           print schema summary
-altonic scan    --source <dir> [--sample N] [--json] [--apply <config>]
-altonic subset  --source <dir> --config <file> [--json]     (preview row counts)
-altonic generate --source <dir> --dest <dir> --config <file>
+altonic schema  --source <src>           print schema summary
+altonic scan    --source <src> [--sample N] [--json] [--apply <config>]
+altonic subset  --source <src> --config <file> [--json] [--verify]
+altonic generate --source <src> --dest <dst> --config <file>
                  [--no-subset] [--dry-run] [--report <file>]
 ```
+
+`<src>`/`<dst>` are dataset directories or `postgres://` URLs, in any combination
+(pg→pg replication, pg→dir snapshots, dir→pg loads).
 
 `generate` is the full pipeline; `--dry-run` runs everything except destination writes.
 Exit codes: 0 success, 1 validation error, 2 runtime error.
@@ -497,6 +537,7 @@ Exit codes: 0 success, 1 validation error, 2 runtime error.
 
 ## 14. Future work
 
-- Postgres/MySQL wire-protocol connectors behind the §7 traits; incremental mode.
+- Postgres: TLS, sequence/identity and index/view/trigger replication, multi-schema
+  runs, incremental mode. MySQL connector behind the §7 traits.
 - Cross-table sum, event-timestamp sequences, XML/HTML masks.
 - Formal DP accounting; workspace inheritance; parallel per-table execution.

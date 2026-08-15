@@ -132,8 +132,8 @@ impl Generator for RandomTimestamp {
         // Shape (date vs datetime) follows the input when parseable, else min.
         let like = match input {
             Value::Null => return Ok(Value::Null),
-            Value::Text(s) => Timestamp::parse(s).unwrap_or(self.min),
-            _ => self.min,
+            Value::Text(s) => Timestamp::parse(s).unwrap_or_else(|| self.min.clone()),
+            _ => self.min.clone(),
         };
         let lo = self.min.to_epoch_seconds();
         let hi = self.max.to_epoch_seconds();

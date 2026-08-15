@@ -12,6 +12,10 @@ pub struct Column {
     pub ty: ColumnType,
     pub nullable: bool,
     pub unique: bool,
+    /// Exact source-database type (e.g. `character varying(80)`), captured by
+    /// database connectors so replicas keep the original shape. None for
+    /// datasets defined only in terms of the portable type model.
+    pub db_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +36,20 @@ pub struct Table {
 }
 
 impl Table {
+    /// Construct a table directly (used by database connectors after
+    /// introspection). Callers should still round-trip the result through
+    /// `Schema::from_json` for full validation.
+    pub fn assemble(
+        name: String,
+        columns: Vec<Column>,
+        primary_key: Vec<String>,
+        foreign_keys: Vec<ForeignKey>,
+    ) -> Table {
+        let col_index =
+            columns.iter().enumerate().map(|(i, c)| (c.name.clone(), i)).collect();
+        Table { name, columns, primary_key, foreign_keys, col_index }
+    }
+
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.col_index.get(name).copied()
     }
@@ -151,6 +169,11 @@ impl WrapTables for Json {
     }
 }
 
+/// Public alias for connectors that build schema JSON table-by-table.
+pub fn table_to_json_pub(t: &Table) -> Json {
+    table_to_json(t)
+}
+
 fn table_to_json(t: &Table) -> Json {
     let mut members = vec![
         ("name".to_string(), Json::Str(t.name.clone())),
@@ -169,6 +192,9 @@ fn table_to_json(t: &Table) -> Json {
                         }
                         if c.unique {
                             m.push(("unique".to_string(), Json::Bool(true)));
+                        }
+                        if let Some(dt) = &c.db_type {
+                            m.push(("db_type".to_string(), Json::Str(dt.clone())));
                         }
                         Json::Object(m)
                     })
@@ -243,8 +269,9 @@ fn parse_table(tj: &Json) -> Result<Table> {
             .ok_or_else(|| verr(format!("schema: unknown column type {ty_str:?} on {name:?}.{cname:?}")))?;
         let nullable = cj.get("nullable").and_then(|n| n.as_bool()).unwrap_or(true);
         let unique = cj.get("unique").and_then(|u| u.as_bool()).unwrap_or(false);
+        let db_type = cj.get("db_type").and_then(|d| d.as_str()).map(str::to_string);
         col_index.insert(cname.clone(), columns.len());
-        columns.push(Column { name: cname, ty, nullable, unique });
+        columns.push(Column { name: cname, ty, nullable, unique, db_type });
     }
     let primary_key = match tj.get("primary_key") {
         Some(Json::Array(items)) => items
