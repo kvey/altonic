@@ -31,7 +31,7 @@ fn path(p: &Path) -> &str {
 fn full_workflow() {
     let dir = tmp("workflow");
     let source = dir.join("source");
-    let config = dir.join("altonic.json");
+    let config = dir.join("altonic.toml");
     let dest = dir.join("dest");
 
     // init
@@ -56,7 +56,7 @@ fn full_workflow() {
     assert!(stderr.contains("actor_email"));
 
     // scan --apply onto a fresh config, then strict passes with it
-    let applied = dir.join("applied.json");
+    let applied = dir.join("applied.toml");
     let (code, _, stderr) = run(&[
         "scan", "--source", path(&source), "--apply", path(&applied),
     ]);
@@ -65,6 +65,37 @@ fn full_workflow() {
         "scan", "--source", path(&source), "--config", path(&applied), "--strict",
     ]);
     assert_eq!(code, 0, "strict scan should pass once recommendations applied");
+
+    // check: scaffolded config leaves audit_log.actor_email unprotected
+    // (warning only — audit_log is truncated? no: truncate makes it n/a, so
+    // the scaffold is actually clean; verify exit 0 and the coverage table).
+    let (code, stdout, stderr) = run(&[
+        "check", "--source", path(&source), "--config", path(&config),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("inherited-key"), "{stdout}");
+
+    // check catches drift: config referencing a column that does not exist.
+    let stale = dir.join("stale.toml");
+    std::fs::write(
+        &stale,
+        "secret = \"s\"\n[tables.customers.columns.ghost]\ngenerator = \"null\"\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(&[
+        "check", "--source", path(&source), "--config", path(&stale), "--sample", "0",
+    ]);
+    assert_eq!(code, 1, "drift must fail: {stdout}{stderr}");
+    assert!(stdout.contains("drift.column_missing"), "{stdout}");
+
+    // check --strict flags unprotected PII (empty config, PII everywhere).
+    let empty = dir.join("empty.toml");
+    std::fs::write(&empty, "secret = \"s\"\n").unwrap();
+    let (code, stdout, _) = run(&[
+        "check", "--source", path(&source), "--config", path(&empty), "--strict",
+    ]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("pii.unprotected"), "{stdout}");
 
     // subset preview with verification
     let (code, stdout, stderr) = run(&[
@@ -115,7 +146,7 @@ fn deterministic_across_processes() {
     let dir = tmp("determinism");
     run(&["init", path(&dir)]);
     let source = dir.join("source");
-    let config = dir.join("altonic.json");
+    let config = dir.join("altonic.toml");
     let (a, b) = (dir.join("a"), dir.join("b"));
     run(&["generate", "--source", path(&source), "--dest", path(&a), "--config", path(&config)]);
     run(&["generate", "--source", path(&source), "--dest", path(&b), "--config", path(&config)]);

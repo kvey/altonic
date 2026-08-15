@@ -154,39 +154,51 @@ values on read and rendered canonically on write. An empty CSV cell is `Null`
 
 ## 4. Workspace configuration
 
-A single JSON file, the analog of a Tonic workspace:
+A single **TOML** file, the analog of a Tonic workspace (JSON with the same tree shape
+is also accepted, detected by a leading `{`; the TOML dialect is in §10.4):
 
-```json
-{
-  "name": "demo",
-  "secret": "workspace-secret-used-for-consistency",
-  "seed": 42,
-  "preserve_referential_integrity": true,
-  "tables": {
-    "customers": {
-      "mode": "de_identify",
-      "columns": {
-        "email":      {"generator": "email", "options": {"consistency": "value"}},
-        "first_name": {"generator": "name",  "options": {"part": "first", "link": "person"}},
-        "last_name":  {"generator": "name",  "options": {"part": "last",  "link": "person"}}
-      }
-    },
-    "audit_log": {"mode": "truncate"}
-  },
-  "subset": {
-    "enabled": true,
-    "targets": [
-      {"table": "orders", "percent": 10.0},
-      {"table": "customers", "where": "state_code == 'CA' or vip == true"}
-    ],
-    "lookup_tables": ["states", "currencies"],
-    "upstream": [
-      {"table": "orders", "where": "total > 100"}
-    ],
-    "out_of_subset": "truncate"
-  }
-}
+```toml
+name = "demo"
+secret = "workspace-secret-used-for-consistency"
+seed = 42
+preserve_referential_integrity = true
+
+[tables.customers.columns.email]
+generator = "email"
+options = { consistency = "value" }
+
+[tables.customers.columns.first_name]
+generator = "name"
+options = { part = "first", link = "person" }
+
+[tables.customers.columns.last_name]
+generator = "name"
+options = { part = "last", link = "person" }
+
+[tables.audit_log]
+mode = "truncate"
+
+[subset]
+enabled = true
+lookup_tables = ["states", "currencies"]
+out_of_subset = "truncate"
+
+[[subset.targets]]
+table = "orders"
+percent = 10.0
+
+[[subset.targets]]
+table = "customers"
+where = "state_code == 'CA' or vip == true"
+
+[[subset.upstream]]
+table = "orders"
+where = "total > 100"
 ```
+
+TOML literal strings (`'...'`) are recommended for regex patterns and `where` clauses
+so backslashes and quotes need no escaping. Composite generators nest naturally as
+sections, e.g. `[tables.t.columns.c.options.groups.1]` for a `regex_mask` group.
 
 Semantics:
 
@@ -207,6 +219,27 @@ names, options of the wrong type, generators incompatible with the column type, 
 columns whose generator cannot honor uniqueness, FK/PK generator conflicts (above), subset
 targets on missing tables, and `where` expressions that do not parse or reference unknown
 columns.
+
+### 4.2 Evaluating a config against the detected source (`altonic check`)
+
+`generate` fails fast; **`check` collects everything at once** so a config can be
+reviewed against the *detected* schema of a live database (or dataset) in one pass:
+
+- **Drift** (`drift.table_missing`, `drift.column_missing`): config entries the source
+  no longer has — the first thing that breaks when the schema migrates under a config.
+- **Validation** (`generator.invalid`, `generator.uniqueness`,
+  `generator.stats_on_key`, `fk.conflicting_generator`, `fk.would_break_join`,
+  `fk.cycle`): everything §4.1 would reject, all reported together.
+- **Coverage**: every detected column classified as
+  `masked` / `inherited_key` (FK inheriting a key map) / `passthrough` /
+  `invalid` / `not_applicable` (table mode ignores columns), summarized per table.
+- **Unprotected PII** (`pii.unprotected`, warning): the sensitivity scan (§9) runs
+  against source data; likely-PII columns left as passthrough are flagged.
+- **Subset** (`subset.invalid`, `subset.target_mode`): the subset section checked
+  against the schema, plus targets whose table mode means no rows would ship anyway.
+
+Issues carry stable machine-readable codes; `--json` emits the full report for CI.
+Exit codes: errors → 1 (generate would fail); `--strict` also fails on warnings.
 
 ---
 
@@ -462,7 +495,9 @@ applied entries so hand-edits are never overwritten silently.
 Implemented in-repo, no external crates:
 
 1. **JSON** (§10.1): recursive-descent parser + serializer, UTF-8, `\uXXXX` escapes and
-   surrogate pairs; used for schema, config, reports, and `json_mask`.
+   surrogate pairs; used for schema files, reports, `json_mask`, and JSON configs.
+1b. **TOML** (§10.4): parser + serializer for the workspace config format, sharing the
+   JSON value tree internally.
 2. **CSV**: RFC 4180 (quoted fields, embedded quotes/newlines/commas), streaming reader
    and writer.
 3. **Regex** (§10.3): backtracking engine — literals, `.`, classes `[a-z0-9_]` (negated,
@@ -491,6 +526,15 @@ null` tests explicitly).
 No backreferences, no lookaround (keeps the engine simple and bounded). `regex_mask`
 requires at least one capture group; group 0 rewriting is not supported.
 
+### 10.4 TOML dialect
+The subset of TOML 1.0 a config needs: bare/quoted/dotted keys, `[table]` and
+`[[array-of-tables]]` headers, basic and literal strings (single- and multi-line),
+integers with `_` separators, floats, booleans, arrays (multi-line, trailing commas),
+inline tables, comments. Rejected with clear errors: datetimes (quote them as strings),
+hex/octal/binary integers, `inf`/`nan`. Duplicate keys and duplicate table headers are
+errors. The serializer emits scalars, then `[[array-of-tables]]`, then subtables, and
+round-trips the config tree exactly.
+
 ---
 
 ## 11. CLI
@@ -499,10 +543,14 @@ requires at least one capture group; group 0 rewriting is not supported.
 altonic init <dir>                       scaffold demo dataset + config
 altonic schema  --source <src>           print schema summary
 altonic scan    --source <src> [--sample N] [--json] [--apply <config>]
+altonic check   --source <src> --config <file> [--sample N] [--json] [--strict]
 altonic subset  --source <src> --config <file> [--json] [--verify]
 altonic generate --source <src> --dest <dst> --config <file>
                  [--no-subset] [--dry-run] [--report <file>]
 ```
+
+Configs are TOML (`scan --apply` writes TOML unless the target path ends in `.json`).
+`check` is the config-vs-database evaluation described in §4.2.
 
 `<src>`/`<dst>` are dataset directories or `postgres://` URLs, in any combination
 (pg→pg replication, pg→dir snapshots, dir→pg loads).

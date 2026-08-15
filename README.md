@@ -59,10 +59,52 @@ $ cargo build --release
 $ export SRC="postgres://user:pass@localhost:5432/prod_copy"
 $ export DST="postgres://user:pass@localhost:5432/masked"
 $ target/release/altonic schema   --source "$SRC"                  # introspect
-$ target/release/altonic scan     --source "$SRC" --apply ws.json  # detect PII, write config
-$ target/release/altonic subset   --source "$SRC" --config ws.json --verify
-$ target/release/altonic generate --source "$SRC" --dest "$DST" --config ws.json
+$ target/release/altonic scan     --source "$SRC" --apply ws.toml  # detect PII, write config
+$ target/release/altonic check    --source "$SRC" --config ws.toml --strict
+$ target/release/altonic subset   --source "$SRC" --config ws.toml --verify
+$ target/release/altonic generate --source "$SRC" --dest "$DST" --config ws.toml
 ```
+
+## The cleaning config (TOML) and `check`
+
+The workspace config is a TOML file (JSON also accepted):
+
+```toml
+secret = "workspace-consistency-key"
+
+[tables.customers.columns.email]
+generator = "email"
+options = { consistency = "value" }
+
+[tables.customers.columns.ssn]
+generator = "ssn"
+
+[subset]
+enabled = true
+lookup_tables = ["states", "products"]
+
+[[subset.targets]]
+table = "orders"
+percent = 20.0
+```
+
+`altonic check` evaluates that config against the **detected** schema of the source
+database and reports everything in one pass — schema drift (config entries the database
+no longer has), invalid generator settings, referential-integrity conflicts, per-column
+coverage, unprotected PII found by sampling real data, and subset validity:
+
+```text
+table                    columns     masked inherited-key  passthrough  invalid
+customers                     13          9             0            4        0
+orders                         5          0             1            4        0
+...
+[ERROR] drift.column_missing         config column "customers"."phone" does not exist in the source
+[WARN ] pii.unprotected              customers.ssn looks like ssn (high confidence) but passes through unmasked
+```
+
+Issues carry stable codes and `--json` emits the full machine-readable report, so
+`check --strict` slots straight into CI: exit 1 if `generate` would fail *or* if any
+detected PII is still passing through.
 
 Verified against a live Postgres 16 with SCRAM auth: a 200-customer / 500-order /
 1200-item source replicates in ~1s with every `varchar(n)`/`char(n)`/`numeric`/`jsonb`/
@@ -100,35 +142,11 @@ one CSV per table — an interchange format any database can dump to and load fr
 engine is written against `SourceConnector`/`DestinationConnector` traits, so live
 database connectors are additive work (see SPEC §7).
 
-## Configuration sketch
-
-```json
-{
-  "name": "demo",
-  "secret": "workspace-consistency-key",
-  "tables": {
-    "customers": {
-      "columns": {
-        "id":         {"generator": "integer_key", "options": {"consistency": "value"}},
-        "email":      {"generator": "email", "options": {"consistency": "value"}},
-        "first_name": {"generator": "name", "options": {"part": "first", "link": "person"}},
-        "last_name":  {"generator": "name", "options": {"part": "last",  "link": "person"}}
-      }
-    },
-    "audit_log": {"mode": "truncate"}
-  },
-  "subset": {
-    "enabled": true,
-    "targets": [{"table": "orders", "percent": 10.0}],
-    "lookup_tables": ["states", "products"],
-    "upstream": [{"table": "order_items"}]
-  }
-}
-```
-
 `orders.customer_id` needs no configuration: it references the masked `customers.id`
-and inherits its key mapping automatically. Columns sharing a `link` label (here
-`person`) draw from one synthetic entity, so first and last names stay coherent.
+and inherits its key mapping automatically (`check` shows it as `inherited-key`).
+Columns sharing a `link` label draw from one synthetic entity, so first and last names
+stay coherent. TOML literal strings (`'...'`) keep regex patterns and `where` clauses
+escape-free.
 
 ## Layout
 
@@ -137,7 +155,8 @@ and inherits its key mapping automatically. Columns sharing a `link` label (here
 | `SPEC.md` | Research summary of Tonic Structural + the normative Altonic spec |
 | `src/crypto.rs`, `src/rng.rs` | SHA-256/HMAC (RFC-vector-tested), SplitMix64→Xoshiro256\*\* |
 | `src/json.rs`, `src/csv.rs`, `src/regex.rs`, `src/expr.rs` | RFC 8259 JSON, RFC 4180 CSV, a memoized backtracking regex VM, and the row-expression language |
-| `src/schema.rs`, `src/value.rs`, `src/config.rs` | Data model and workspace config |
+| `src/schema.rs`, `src/value.rs`, `src/config.rs`, `src/toml.rs` | Data model, workspace config, TOML parser/serializer |
+| `src/check.rs` | Config-vs-detected-schema evaluation (`altonic check`) |
 | `src/connector.rs` | Connector traits + directory dataset implementation |
 | `src/pg/` | Postgres: wire protocol, SCRAM/MD5 auth, COPY codec, introspection, connectors |
 | `src/generators/` | Generator trait, seeding discipline, and the full catalog |
@@ -149,9 +168,10 @@ and inherits its key mapping automatically. Columns sharing a `link` label (here
 ## Testing
 
 ```console
-$ cargo test        # 127 tests: crypto vectors (SHA-256, HMAC, PBKDF2/SCRAM RFC 7677,
-                    # MD5, base64), regex behavior, COPY codec round-trips, closure
-                    # invariants, FK-integrity end-to-end, byte-identical rerun checks
+$ cargo test        # 139 tests: crypto vectors (SHA-256, HMAC, PBKDF2/SCRAM RFC 7677,
+                    # MD5, base64), TOML/JSON/CSV/regex behavior, COPY codec round-trips,
+                    # closure invariants, config-check scenarios, FK-integrity
+                    # end-to-end, byte-identical rerun checks
 
 # Live Postgres integration (points at throwaway databases it may drop/recreate):
 $ ALTONIC_PG_TEST_SRC=postgres://u:p@localhost/src \

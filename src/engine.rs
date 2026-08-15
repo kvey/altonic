@@ -101,6 +101,62 @@ struct TablePlan {
     link_groups: HashMap<String, Vec<usize>>,
 }
 
+/// FK column pairing across the schema: child (table, column) → directly
+/// referenced parent (table, column). Shared by planning and `check`.
+pub(crate) fn fk_parent_map(schema: &Schema) -> HashMap<(String, String), (String, String)> {
+    let mut fk_parent = HashMap::new();
+    for t in &schema.tables {
+        for fk in &t.foreign_keys {
+            for (cc, pc) in fk.columns.iter().zip(&fk.references_columns) {
+                fk_parent.insert(
+                    (t.name.clone(), cc.clone()),
+                    (fk.references_table.clone(), pc.clone()),
+                );
+            }
+        }
+    }
+    fk_parent
+}
+
+/// Follow FK chains to the ultimate referenced column (a column can be both
+/// referenced and itself an FK child, e.g. shared primary keys). Cycles
+/// error out.
+pub(crate) fn resolve_fk_root(
+    fk_parent: &HashMap<(String, String), (String, String)>,
+    mut key: (String, String),
+) -> Result<(String, String)> {
+    let mut seen = HashSet::new();
+    while let Some(parent) = fk_parent.get(&key) {
+        if !seen.insert(key.clone()) {
+            return Err(verr(format!(
+                "foreign key cycle through {}.{} cannot be masked; break the cycle or disable preserve_referential_integrity",
+                key.0, key.1
+            )));
+        }
+        key = parent.clone();
+    }
+    Ok(key)
+}
+
+/// Referenced root columns that carry an explicit generator → get key maps.
+pub(crate) fn mapped_root_set(
+    schema: &Schema,
+    config: &Config,
+    fk_parent: &HashMap<(String, String), (String, String)>,
+) -> Result<HashSet<(String, String)>> {
+    let _ = schema;
+    let mut mapped_roots = HashSet::new();
+    if config.preserve_referential_integrity {
+        for parent in fk_parent.values() {
+            let root = resolve_fk_root(fk_parent, parent.clone())?;
+            if config.column_config(&root.0, &root.1).is_some() {
+                mapped_roots.insert(root);
+            }
+        }
+    }
+    Ok(mapped_roots)
+}
+
 /// Validate the whole configuration against the schema and build per-table
 /// plans. Fails fast (SPEC §4.1).
 fn plan(schema: &Schema, config: &Config) -> Result<HashMap<String, TablePlan>> {
@@ -117,47 +173,9 @@ fn plan(schema: &Schema, config: &Config) -> Result<HashMap<String, TablePlan>> 
         }
     }
 
-    // Which (table, column) pairs are referenced by FKs, and by whom.
-    // child (table, col) -> parent (table, col)
-    let mut fk_parent: HashMap<(String, String), (String, String)> = HashMap::new();
-    for t in &schema.tables {
-        for fk in &t.foreign_keys {
-            for (cc, pc) in fk.columns.iter().zip(&fk.references_columns) {
-                fk_parent.insert(
-                    (t.name.clone(), cc.clone()),
-                    (fk.references_table.clone(), pc.clone()),
-                );
-            }
-        }
-    }
-
-    // Resolve the ultimate map source for a referenced column: follow chains
-    // (a column can be both referenced and itself an FK child, e.g. shared
-    // primary keys). Cycles error out.
-    let resolve_root = |mut key: (String, String)| -> Result<(String, String)> {
-        let mut seen = HashSet::new();
-        while let Some(parent) = fk_parent.get(&key) {
-            if !seen.insert(key.clone()) {
-                return Err(verr(format!(
-                    "foreign key cycle through {}.{} cannot be masked; break the cycle or disable preserve_referential_integrity",
-                    key.0, key.1
-                )));
-            }
-            key = parent.clone();
-        }
-        Ok(key)
-    };
-
-    // Referenced roots that carry an explicit generator → will get key maps.
-    let mut mapped_roots: HashSet<(String, String)> = HashSet::new();
-    if config.preserve_referential_integrity {
-        for ((_ct, _cc), parent) in &fk_parent {
-            let root = resolve_root(parent.clone())?;
-            if config.column_config(&root.0, &root.1).is_some() {
-                mapped_roots.insert(root);
-            }
-        }
-    }
+    let fk_parent = fk_parent_map(schema);
+    let resolve_root = |key: (String, String)| resolve_fk_root(&fk_parent, key);
+    let mapped_roots = mapped_root_set(schema, config, &fk_parent)?;
 
     let mut plans = HashMap::new();
     for t in &schema.tables {

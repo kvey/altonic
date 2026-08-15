@@ -118,9 +118,23 @@ impl Config {
         self.subset.as_ref().map(|s| s.enabled).unwrap_or(false)
     }
 
+    /// Parse a workspace config. TOML is the primary format; JSON is also
+    /// accepted (detected by a leading `{`).
     pub fn parse(text: &str) -> Result<Config> {
-        let root = Json::parse(text).map_err(|e| verr(format!("config: {e}")))?;
+        let root = if text.trim_start().starts_with('{') {
+            Json::parse(text).map_err(|e| verr(format!("config: {e}")))?
+        } else {
+            crate::toml::parse(text).map_err(|e| match e {
+                crate::Error::Validation(m) => verr(format!("config: {m}")),
+                other => other,
+            })?
+        };
         Self::from_json(&root)
+    }
+
+    /// Render as TOML (the preferred on-disk format).
+    pub fn to_toml(&self) -> Result<String> {
+        crate::toml::to_toml(&self.to_json())
     }
 
     pub fn from_json(root: &Json) -> Result<Config> {
@@ -418,6 +432,51 @@ pub mod tests {
         assert_eq!(c2.secret, c.secret);
         assert_eq!(c2.table_order, c.table_order);
         assert_eq!(c2.subset.as_ref().unwrap().targets.len(), 1);
+    }
+
+    #[test]
+    fn parses_toml_and_round_trips() {
+        let toml_src = r#"
+name = "demo"
+secret = "test-secret"
+seed = 7
+
+[tables.customers.columns.email]
+generator = "email"
+options = { consistency = "value" }
+
+[tables.audit_log]
+mode = "truncate"
+
+[subset]
+enabled = true
+lookup_tables = ["states"]
+
+[[subset.targets]]
+table = "orders"
+percent = 10.0
+
+[[subset.upstream]]
+table = "orders"
+where = "total > 100"
+"#;
+        let c = Config::parse(toml_src).unwrap();
+        assert_eq!(c.secret, "test-secret");
+        assert_eq!(c.mode_for("audit_log"), TableMode::Truncate);
+        assert_eq!(c.column_config("customers", "email").unwrap().generator, "email");
+        let s = c.subset.as_ref().unwrap();
+        assert!(matches!(s.targets[0].filter, TargetFilter::Percent(p) if p == 10.0));
+        assert_eq!(s.upstream[0].where_clause.as_deref(), Some("total > 100"));
+
+        // TOML render → reparse → same semantics; and matches the JSON parse.
+        let rendered = c.to_toml().unwrap();
+        let c2 = Config::parse(&rendered).unwrap();
+        assert_eq!(c2.to_json(), c.to_json(), "TOML round trip drifted:\n{rendered}");
+        let json_c = Config::parse(demo_config_json()).unwrap();
+        assert_eq!(
+            Config::parse(&json_c.to_toml().unwrap()).unwrap().to_json(),
+            json_c.to_json()
+        );
     }
 
     #[test]

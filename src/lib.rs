@@ -3,6 +3,7 @@
 //! Zero external dependencies: JSON, CSV, regex, SHA-256/HMAC, and the PRNG are
 //! all implemented in this crate. See SPEC.md for the full design.
 
+pub mod check;
 pub mod cli;
 pub mod config;
 pub mod connector;
@@ -18,6 +19,7 @@ pub mod rng;
 pub mod scan;
 pub mod schema;
 pub mod subset;
+pub mod toml;
 pub mod value;
 
 /// Crate-wide error type. Variants distinguish validation (config/schema)

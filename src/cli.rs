@@ -19,6 +19,8 @@ USAGE:
   altonic schema   --source <src>             print the source schema
   altonic scan     --source <src> [--config <file>] [--sample N]
                    [--json] [--apply <file>] [--strict]
+  altonic check    --source <src> --config <file> [--sample N]
+                   [--json] [--strict]
   altonic subset   --source <src> --config <file> [--json] [--verify]
   altonic generate --source <src> --dest <dst> --config <file>
                    [--no-subset] [--dry-run] [--report <file>] [--json]
@@ -100,6 +102,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         "init" => cmd_init(rest),
         "schema" => cmd_schema(rest),
         "scan" => cmd_scan(rest),
+        "check" => cmd_check(rest),
         "subset" => cmd_subset(rest),
         "generate" => cmd_generate(rest),
         "help" | "--help" | "-h" => {
@@ -217,7 +220,14 @@ fn cmd_scan(args: &[String]) -> Result<()> {
             ))?
         };
         let applied = scan::apply_to_config(&report, &mut config);
-        std::fs::write(apply_path, config.to_json().to_string_pretty())
+        // Match the target's extension: .json keeps JSON, everything else
+        // gets TOML (the preferred format).
+        let rendered = if apply_path.ends_with(".json") {
+            config.to_json().to_string_pretty()
+        } else {
+            config.to_toml()?
+        };
+        std::fs::write(apply_path, rendered)
             .map_err(|e| crate::rerr(format!("cannot write {apply_path}: {e}")))?;
         println!("\nApplied {applied} recommendation(s) to {apply_path}");
     }
@@ -251,6 +261,84 @@ fn fresh_secret() -> String {
         &[&now.to_be_bytes(), &(std::process::id() as u64).to_be_bytes()],
     );
     crate::crypto::to_hex(&digest)[..32].to_string()
+}
+
+// ---------- check ----------
+
+fn cmd_check(args: &[String]) -> Result<()> {
+    let f = parse_flags(args, &["source", "config", "sample"], &["json", "strict"])?;
+    let source_spec = f.require("source")?;
+    let config_path = f.require("config")?;
+    let ds = open_source(source_spec)?;
+    let config = load_config(config_path)?;
+    let sample: usize = match f.named.get("sample") {
+        Some(s) => s.parse().map_err(|_| crate::verr("--sample must be a number"))?,
+        None => 1000,
+    };
+    let report = crate::check::check(ds.as_ref(), &config, sample)?;
+
+    if f.has("json") {
+        println!("{}", report.to_json().to_string_pretty());
+    } else {
+        println!("Config {config_path} vs detected schema of {source_spec}\n");
+        println!(
+            "{:<24} {:>7} {:>10} {:>13} {:>12} {:>8}",
+            "table", "columns", "masked", "inherited-key", "passthrough", "invalid"
+        );
+        for t in ds.schema().tables.iter() {
+            let (masked, inherited, passthrough, invalid, na, total) =
+                crate::check::table_summary(&report, &t.name);
+            let mode = config.mode_for(&t.name);
+            if na == total && total > 0 {
+                println!(
+                    "{:<24} {:>7}   ({} — column masking not applicable)",
+                    t.name,
+                    total,
+                    mode.name()
+                );
+            } else {
+                println!(
+                    "{:<24} {:>7} {:>10} {:>13} {:>12} {:>8}",
+                    t.name, total, masked, inherited, passthrough, invalid
+                );
+            }
+        }
+        if !report.issues.is_empty() {
+            println!();
+            for issue in &report.issues {
+                let sev = match issue.severity {
+                    crate::check::Severity::Error => "ERROR",
+                    crate::check::Severity::Warning => "WARN ",
+                };
+                println!("[{sev}] {:<28} {}", issue.code, issue.message);
+            }
+        }
+        println!(
+            "\n{} error(s), {} warning(s); {} column(s) across {} table(s); {} row(s) sampled for PII.",
+            report.errors(),
+            report.warnings(),
+            report.columns.len(),
+            ds.schema().tables.len(),
+            report.sampled_rows
+        );
+        if report.errors() == 0 && report.warnings() == 0 {
+            println!("Config is fully consistent with the detected schema.");
+        }
+    }
+
+    if report.errors() > 0 {
+        return Err(crate::verr(format!(
+            "check found {} error(s); `generate` would fail with this config",
+            report.errors()
+        )));
+    }
+    if f.has("strict") && report.warnings() > 0 {
+        return Err(crate::verr(format!(
+            "strict mode: {} warning(s) (unprotected PII or ignored configuration)",
+            report.warnings()
+        )));
+    }
+    Ok(())
 }
 
 // ---------- subset ----------
@@ -375,7 +463,7 @@ fn cmd_init(args: &[String]) -> Result<()> {
     std::fs::write(source.join("products.csv"), DEMO_PRODUCTS)?;
     std::fs::write(source.join("audit_log.csv"), DEMO_AUDIT)?;
 
-    let config_path = root.join("altonic.json");
+    let config_path = root.join("altonic.toml");
     let config_text = DEMO_CONFIG.replace("__SECRET__", &fresh_secret());
     // Validate what we scaffold.
     Config::parse(&config_text)?;
@@ -537,44 +625,73 @@ id,actor_email,action,at
 2,admin@corp.example,export,2024-01-02 00:10:44
 ";
 
-const DEMO_CONFIG: &str = r#"{
-  "name": "demo",
-  "secret": "__SECRET__",
-  "seed": 1,
-  "preserve_referential_integrity": true,
-  "tables": {
-    "customers": {
-      "columns": {
-        "id": {"generator": "integer_key", "options": {"consistency": "value"}},
-        "first_name": {"generator": "name", "options": {"part": "first", "link": "person", "consistency": "value"}},
-        "last_name": {"generator": "name", "options": {"part": "last", "link": "person", "consistency": "value"}},
-        "email": {"generator": "email", "options": {"consistency": "value"}},
-        "phone": {"generator": "phone", "options": {"consistency": "value"}},
-        "ssn": {"generator": "ssn", "options": {"consistency": "value"}},
-        "street": {"generator": "address", "options": {"part": "street", "link": "addr"}},
-        "city": {"generator": "address", "options": {"part": "city", "link": "addr"}},
-        "zip": {"generator": "address", "options": {"part": "zip", "link": "addr"}},
-        "created_at": {"generator": "timestamp_shift", "options": {"days": 30, "consistency": "value"}}
-      }
-    },
-    "orders": {
-      "columns": {
-        "total": {"generator": "noise", "options": {"scale": 0.05, "decimals": 2}},
-        "placed_at": {"generator": "timestamp_shift", "options": {"days": 14}}
-      }
-    },
-    "audit_log": {"mode": "truncate"}
-  },
-  "subset": {
-    "enabled": false,
-    "targets": [
-      {"table": "orders", "percent": 50.0}
-    ],
-    "lookup_tables": ["states", "products"],
-    "upstream": [
-      {"table": "order_items"}
-    ],
-    "out_of_subset": "truncate"
-  }
-}
+const DEMO_CONFIG: &str = r#"# Altonic workspace configuration.
+# The secret keys all consistent masking - treat it like a credential.
+name = "demo"
+secret = "__SECRET__"
+seed = 1
+preserve_referential_integrity = true
+
+[tables.customers.columns.id]
+generator = "integer_key"
+options = { consistency = "value" }
+
+[tables.customers.columns.first_name]
+generator = "name"
+options = { part = "first", link = "person", consistency = "value" }
+
+[tables.customers.columns.last_name]
+generator = "name"
+options = { part = "last", link = "person", consistency = "value" }
+
+[tables.customers.columns.email]
+generator = "email"
+options = { consistency = "value" }
+
+[tables.customers.columns.phone]
+generator = "phone"
+options = { consistency = "value" }
+
+[tables.customers.columns.ssn]
+generator = "ssn"
+options = { consistency = "value" }
+
+[tables.customers.columns.street]
+generator = "address"
+options = { part = "street", link = "addr" }
+
+[tables.customers.columns.city]
+generator = "address"
+options = { part = "city", link = "addr" }
+
+[tables.customers.columns.zip]
+generator = "address"
+options = { part = "zip", link = "addr" }
+
+[tables.customers.columns.created_at]
+generator = "timestamp_shift"
+options = { days = 30, consistency = "value" }
+
+[tables.orders.columns.total]
+generator = "noise"
+options = { scale = 0.05, decimals = 2 }
+
+[tables.orders.columns.placed_at]
+generator = "timestamp_shift"
+options = { days = 14 }
+
+[tables.audit_log]
+mode = "truncate"
+
+[subset]
+enabled = false
+lookup_tables = ["states", "products"]
+out_of_subset = "truncate"
+
+[[subset.targets]]
+table = "orders"
+percent = 50.0
+
+[[subset.upstream]]
+table = "order_items"
 "#;
