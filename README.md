@@ -15,17 +15,19 @@ $ altonic generate \
     --config workspace.json
 ```
 
-**Zero external dependencies.** The Postgres wire protocol (SCRAM-SHA-256/MD5 auth,
-COPY streaming), JSON, CSV, regex, SHA-256/HMAC/PBKDF2, MD5, base64, and the
-deterministic PRNG are all implemented in this repository; `cargo build` needs only the
-Rust standard library. See [SPEC.md](SPEC.md) for the full specification.
+**Pure Rust, no libpq, no OpenSSL.** `cargo build` needs a Rust toolchain and nothing
+else on the machine — no system Postgres client, no C toolchain. Solved problems are
+handled by their crates ([`postgres`](https://crates.io/crates/postgres),
+`serde_json`, `toml`, `regex`, `sha2`/`hmac`, `rand`, `clap`); what this repository
+implements is the de-identification itself. See [SPEC.md](SPEC.md) for the full
+specification.
 
 ## Highlights
 
-- **Live Postgres → Postgres replication, no libpq**: the frontend/backend protocol v3
-  is implemented from the spec — startup, cleartext/MD5/**SCRAM-SHA-256** auth (server
-  signature verified), simple queries, and `COPY TO STDOUT` / `COPY FROM STDIN`
-  text-format streaming. Schema introspection captures exact types
+- **Live Postgres → Postgres replication**: cleartext/MD5/**SCRAM-SHA-256** auth and
+  `COPY TO STDOUT` / `COPY FROM STDIN` text-format streaming, over the `postgres`
+  driver; each copy runs on its own connection and thread, so network I/O overlaps
+  with masking. Schema introspection captures exact types
   (`character varying(40)` stays `character varying(40)`), PKs, uniques, and
   composite-correct FKs; the destination is rebuilt with the same DDL shape and FKs are
   attached after load so table order never matters. Sources and destinations mix

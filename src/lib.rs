@@ -1,7 +1,11 @@
 //! Altonic: pure-Rust database data cleaning, subsetting, and replication.
 //!
-//! Zero external dependencies: JSON, CSV, regex, SHA-256/HMAC, and the PRNG are
-//! all implemented in this crate. See SPEC.md for the full design.
+//! What is altonic's own work lives here: the generator catalog, the seeding
+//! and consistency discipline, subsetting, the schema model, and the CSV codec
+//! (whose per-field quoting distinguishes NULL from the empty string, which no
+//! CSV crate exposes). Formats, protocols and primitives are dependencies:
+//! `postgres`, `serde_json`, `toml`, `regex`, `sha2`/`hmac`, `rand`, `clap`.
+//! Pure Rust throughout — no libpq, no OpenSSL. See SPEC.md for the design.
 
 pub mod check;
 pub mod cli;
