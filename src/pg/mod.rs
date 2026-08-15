@@ -1,12 +1,10 @@
-//! Postgres connectors (pure Rust, no external crates): a `SourceConnector`
-//! that introspects and streams a live database, and a `DestinationConnector`
-//! that recreates the same shape — original column types, PKs, uniques, and
-//! FKs — and bulk-loads masked rows via COPY.
+//! Postgres connectors: a `SourceConnector` that introspects and streams a
+//! live database, and a `DestinationConnector` that recreates the same shape —
+//! original column types, PKs, uniques, and FKs — and bulk-loads masked rows
+//! via COPY. The wire protocol, authentication and TLS-less transport all come
+//! from the `postgres` driver.
 
-mod b64;
-mod md5;
-mod proto;
-mod scram;
+mod copy;
 mod text;
 mod url;
 
@@ -15,9 +13,10 @@ pub use url::PgUrl;
 /// Run one or more SQL statements against a database (used by integration
 /// tests and one-off administration; results are discarded).
 pub fn run_sql(url_text: &str, sql: &str) -> Result<()> {
-    let url = PgUrl::parse(url_text)?;
-    let mut conn = PgConn::connect(&url)?;
-    conn.simple_query(sql)?;
+    let mut client = PgUrl::parse(url_text)?.connect()?;
+    client
+        .batch_execute(sql)
+        .map_err(|e| rerr(format!("postgres: {}", describe(&e))))?;
     Ok(())
 }
 
@@ -25,9 +24,44 @@ use crate::connector::{DestinationConnector, RowSink, RowSource, SourceConnector
 use crate::schema::{Column, ForeignKey, Schema, Table};
 use crate::value::Row;
 use crate::{rerr, verr, Result};
-use proto::PgConn;
+use copy::{CopyIn, CopyOut};
+use postgres::{Client, SimpleQueryMessage};
 use std::collections::HashMap;
 use text::{copy_escape, copy_split, default_pg_type, map_pg_type, quote_ident, quote_literal, text_to_value, value_to_text};
+
+/// Render a driver error, preferring the server's own severity and message
+/// over the driver's wrapper text.
+fn describe(e: &postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db) => {
+            let detail = db.detail().map(|d| format!(" ({d})")).unwrap_or_default();
+            format!("{}: {}{detail}", db.severity(), db.message())
+        }
+        None => e.to_string(),
+    }
+}
+
+/// Run a statement and collect its rows as text (None = NULL per cell).
+fn text_rows(client: &mut Client, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+    let messages = client
+        .simple_query(sql)
+        .map_err(|e| rerr(format!("postgres: {}\n  while running: {sql}", describe(&e))))?;
+    let mut rows = Vec::new();
+    for message in messages {
+        if let SimpleQueryMessage::Row(r) = message {
+            rows.push((0..r.len()).map(|i| r.get(i).map(str::to_string)).collect());
+        }
+    }
+    Ok(rows)
+}
+
+/// Convenience: run and expect a single text column.
+fn text_column(client: &mut Client, sql: &str) -> Result<Vec<String>> {
+    Ok(text_rows(client, sql)?
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .collect())
+}
 
 // ---------- Source ----------
 
@@ -39,8 +73,8 @@ pub struct PgSource {
 impl PgSource {
     pub fn connect(url_text: &str) -> Result<PgSource> {
         let url = PgUrl::parse(url_text)?;
-        let mut conn = PgConn::connect(&url)?;
-        let schema = introspect(&mut conn, &url.schema)?;
+        let mut client = url.connect()?;
+        let schema = introspect(&mut client, &url.schema)?;
         if schema.tables.is_empty() {
             return Err(verr(format!(
                 "postgres source {} has no tables in schema {:?}",
@@ -65,7 +99,6 @@ impl SourceConnector for PgSource {
             .clone();
         // Dedicated connection per stream: the engine holds several streams
         // across its passes, and COPY occupies a whole connection.
-        let mut conn = PgConn::connect(&self.url)?;
         let cols: Vec<String> = t.columns.iter().map(|c| quote_ident(&c.name)).collect();
         let sql = format!(
             "COPY {}.{} ({}) TO STDOUT",
@@ -73,19 +106,19 @@ impl SourceConnector for PgSource {
             quote_ident(&t.name),
             cols.join(", ")
         );
-        conn.copy_out_start(&sql)?;
-        Ok(Box::new(PgRowSource { conn, table: t }))
+        let copy = CopyOut::start(&self.url, sql)?;
+        Ok(Box::new(PgRowSource { copy, table: t }))
     }
 }
 
 struct PgRowSource {
-    conn: PgConn,
+    copy: CopyOut,
     table: Table,
 }
 
 impl RowSource for PgRowSource {
     fn next_row(&mut self) -> Result<Option<Row>> {
-        let Some(line) = self.conn.copy_out_line()? else { return Ok(None) };
+        let Some(line) = self.copy.next_line()? else { return Ok(None) };
         let fields = copy_split(&line)?;
         if fields.len() != self.table.columns.len() {
             return Err(rerr(format!(
@@ -105,17 +138,17 @@ impl RowSource for PgRowSource {
 
 // ---------- Introspection ----------
 
-fn introspect(conn: &mut PgConn, schema_name: &str) -> Result<Schema> {
+fn introspect(client: &mut Client, schema_name: &str) -> Result<Schema> {
     let ns = quote_literal(schema_name);
 
     // Base tables, in name order (deterministic).
-    let table_names = conn.query_strings(&format!(
+    let table_names = text_column(client, &format!(
         "SELECT table_name FROM information_schema.tables \
          WHERE table_schema = {ns} AND table_type = 'BASE TABLE' ORDER BY table_name"
     ))?;
 
     // Columns with exact types.
-    let col_rows = conn.simple_query(&format!(
+    let col_rows = text_rows(client, &format!(
         "SELECT c.table_name, c.column_name, c.udt_name, c.is_nullable, \
                 format_type(a.atttypid, a.atttypmod) \
          FROM information_schema.columns c \
@@ -126,7 +159,7 @@ fn introspect(conn: &mut PgConn, schema_name: &str) -> Result<Schema> {
     ))?;
 
     // Primary keys, unique single-column constraints.
-    let pk_rows = conn.simple_query(&format!(
+    let pk_rows = text_rows(client, &format!(
         "SELECT tc.table_name, kcu.column_name, tc.constraint_type, tc.constraint_name \
          FROM information_schema.table_constraints tc \
          JOIN information_schema.key_column_usage kcu \
@@ -136,7 +169,7 @@ fn introspect(conn: &mut PgConn, schema_name: &str) -> Result<Schema> {
     ))?;
 
     // Foreign keys with correct composite pairing via position_in_unique_constraint.
-    let fk_rows = conn.simple_query(&format!(
+    let fk_rows = text_rows(client, &format!(
         "SELECT rc.constraint_name, kcu.table_name, kcu.column_name, \
                 kcu2.table_name, kcu2.column_name \
          FROM information_schema.referential_constraints rc \
@@ -250,7 +283,7 @@ fn introspect(conn: &mut PgConn, schema_name: &str) -> Result<Schema> {
 
 pub struct PgDestination {
     url: PgUrl,
-    conn: PgConn,
+    client: Client,
     schema: Option<Schema>,
     /// Tables whose DDL ran (dropped + created) this run.
     created: Vec<String>,
@@ -259,8 +292,12 @@ pub struct PgDestination {
 impl PgDestination {
     pub fn connect(url_text: &str) -> Result<PgDestination> {
         let url = PgUrl::parse(url_text)?;
-        let conn = PgConn::connect(&url)?;
-        Ok(PgDestination { url, conn, schema: None, created: Vec::new() })
+        let client = url.connect()?;
+        Ok(PgDestination { url, client, schema: None, created: Vec::new() })
+    }
+
+    fn run(&mut self, sql: &str) -> Result<()> {
+        text_rows(&mut self.client, sql).map(|_| ())
     }
 
     fn ddl_for(&self, t: &Table) -> String {
@@ -296,7 +333,7 @@ impl DestinationConnector for PgDestination {
         // DDL runs lazily per table in open_table so that
         // preserve_destination tables are never touched; here we just make
         // sure the target schema exists and remember the plan.
-        self.conn.simple_query(&format!(
+        self.run(&format!(
             "CREATE SCHEMA IF NOT EXISTS {}",
             quote_ident(&self.url.schema)
         ))?;
@@ -307,43 +344,39 @@ impl DestinationConnector for PgDestination {
     fn open_table(&mut self, table: &Table) -> Result<Box<dyn RowSink>> {
         let schema = quote_ident(&self.url.schema);
         let name = quote_ident(&table.name);
-        self.conn
-            .simple_query(&format!("DROP TABLE IF EXISTS {schema}.{name} CASCADE"))?;
-        self.conn.simple_query(&self.ddl_for(table))?;
+        self.run(&format!("DROP TABLE IF EXISTS {schema}.{name} CASCADE"))?;
+        let ddl = self.ddl_for(table);
+        self.run(&ddl)?;
         self.created.push(table.name.clone());
 
         // COPY occupies the whole connection; give the sink its own so the
         // destination connection stays usable for DDL of later tables.
-        let mut conn = PgConn::connect(&self.url)?;
         let cols: Vec<String> = table.columns.iter().map(|c| quote_ident(&c.name)).collect();
-        conn.copy_in_start(&format!(
-            "COPY {schema}.{name} ({}) FROM STDIN",
-            cols.join(", ")
-        ))?;
-        Ok(Box::new(PgRowSink { conn, line: Vec::new(), done: false }))
+        let copy = CopyIn::start(
+            &self.url,
+            format!("COPY {schema}.{name} ({}) FROM STDIN", cols.join(", ")),
+        )?;
+        Ok(Box::new(PgRowSink { copy, line: Vec::new(), done: false }))
     }
 
     fn has_table_data(&self, table: &str) -> bool {
-        let mut conn = match PgConn::connect(&self.url) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
+        let Ok(mut client) = self.url.connect() else { return false };
         // Probe existence first (a SELECT from a missing table errors).
         let regclass = quote_literal(&format!(
             "{}.{}",
             quote_ident(&self.url.schema),
             quote_ident(table)
         ));
-        let exists = conn
-            .query_strings(&format!(
-                "SELECT CASE WHEN to_regclass({regclass}) IS NULL THEN 'f' ELSE 't' END"
-            ))
-            .map(|r| r.first().map(|s| s == "t").unwrap_or(false))
-            .unwrap_or(false);
+        let exists = text_column(
+            &mut client,
+            &format!("SELECT CASE WHEN to_regclass({regclass}) IS NULL THEN 'f' ELSE 't' END"),
+        )
+        .map(|r| r.first().map(|s| s == "t").unwrap_or(false))
+        .unwrap_or(false);
         if !exists {
             return false;
         }
-        conn.query_strings(&format!(
+        text_column(&mut client, &format!(
             "SELECT CASE WHEN EXISTS (SELECT 1 FROM {}.{} LIMIT 1) THEN 't' ELSE 'f' END",
             quote_ident(&self.url.schema),
             quote_ident(table)
@@ -366,7 +399,7 @@ impl DestinationConnector for PgDestination {
                 let refs: Vec<String> =
                     fk.references_columns.iter().map(|c| quote_ident(c)).collect();
                 let cname = quote_ident(&format!("altonic_fk_{}_{}", t.name, i));
-                self.conn.simple_query(&format!(
+                self.run(&format!(
                     "ALTER TABLE {ns}.{} ADD CONSTRAINT {cname} FOREIGN KEY ({}) REFERENCES {ns}.{} ({})",
                     quote_ident(&t.name),
                     cols.join(", "),
@@ -380,7 +413,7 @@ impl DestinationConnector for PgDestination {
 }
 
 struct PgRowSink {
-    conn: PgConn,
+    copy: CopyIn,
     line: Vec<u8>,
     done: bool,
 }
@@ -397,13 +430,13 @@ impl RowSink for PgRowSink {
                 Some(s) => copy_escape(&s, &mut self.line),
             }
         }
-        self.conn.copy_in_data(&self.line)
+        self.copy.write_line(&self.line)
     }
 
     fn finish(&mut self) -> Result<()> {
         if !self.done {
             self.done = true;
-            self.conn.copy_in_finish()?;
+            self.copy.finish()?;
         }
         Ok(())
     }

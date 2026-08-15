@@ -1,37 +1,20 @@
-//! Connection URL parsing: postgres://user[:password]@host[:port]/database
-//! with optional query parameters (`sslmode`, `schema`, `password`).
-//! The password may also come from the PGPASSWORD environment variable.
+//! Connection URL handling.
+//!
+//! The `postgres` driver does the real parsing (percent-decoding, multi-host
+//! lists, libpq keywords); this layer only splits out altonic's own `schema`
+//! parameter — which the driver would reject as unknown — supplies the
+//! PGPASSWORD fallback, and keeps a redacted form for logs and reports.
 
-use crate::{verr, Result};
+use crate::{rerr, verr, Result};
+use postgres::{Client, Config, NoTls};
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct PgUrl {
-    pub user: String,
-    password: Option<String>,
-    pub host: String,
-    pub port: u16,
-    pub database: String,
+    config: Config,
+    /// Namespace altonic reads from and writes to (`?schema=`).
     pub schema: String,
-}
-
-fn percent_decode(s: &str) -> Result<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = s
-                .get(i + 1..i + 3)
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-                .ok_or_else(|| verr(format!("bad percent-escape in URL near {s:?}")))?;
-            out.push(hex);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_| verr("URL percent-escape decodes to invalid UTF-8"))
+    redacted: String,
 }
 
 impl PgUrl {
@@ -39,79 +22,89 @@ impl PgUrl {
         s.starts_with("postgres://") || s.starts_with("postgresql://")
     }
 
-    pub fn parse(url: &str) -> Result<PgUrl> {
-        let rest = url
-            .strip_prefix("postgres://")
-            .or_else(|| url.strip_prefix("postgresql://"))
-            .ok_or_else(|| verr(format!("not a postgres URL: {url:?}")))?;
-
-        let (rest, query) = match rest.split_once('?') {
-            Some((r, q)) => (r, Some(q)),
-            None => (rest, None),
-        };
-        let (userinfo, hostpart) = match rest.rsplit_once('@') {
-            Some((u, h)) => (Some(u), h),
-            None => (None, rest),
-        };
-        let (hostport, database) = match hostpart.split_once('/') {
-            Some((hp, db)) if !db.is_empty() => (hp, percent_decode(db)?),
-            _ => return Err(verr(format!("postgres URL must include a database: {url:?}"))),
-        };
-        let (host, port) = match hostport.rsplit_once(':') {
-            Some((h, p)) => (
-                h.to_string(),
-                p.parse::<u16>().map_err(|_| verr(format!("bad port in URL: {url:?}")))?,
-            ),
-            None => (hostport.to_string(), 5432),
-        };
-        if host.is_empty() {
-            return Err(verr(format!("postgres URL missing host: {url:?}")));
+    pub fn parse(text: &str) -> Result<PgUrl> {
+        if !PgUrl::is_pg_url(text) {
+            return Err(verr(format!("not a postgres URL: {text:?}")));
+        }
+        let mut url = url::Url::parse(text)
+            .map_err(|e| verr(format!("bad postgres URL {text:?}: {e}")))?;
+        if url.host_str().unwrap_or("").is_empty() {
+            return Err(verr(format!("postgres URL missing host: {text:?}")));
+        }
+        if url.path().trim_start_matches('/').is_empty() {
+            return Err(verr(format!("postgres URL must include a database: {text:?}")));
         }
 
-        let (user, mut password) = match userinfo {
-            None => ("postgres".to_string(), None),
-            Some(ui) => match ui.split_once(':') {
-                Some((u, p)) => (percent_decode(u)?, Some(percent_decode(p)?)),
-                None => (percent_decode(ui)?, None),
-            },
-        };
-
+        // `schema` is ours; everything else is passed through to the driver.
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
         let mut schema = "public".to_string();
-        if let Some(q) = query {
-            for pair in q.split('&').filter(|p| !p.is_empty()) {
-                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                let v = percent_decode(v)?;
-                match k {
-                    "sslmode" => {
-                        if v != "disable" && v != "prefer" && v != "allow" {
-                            return Err(verr(format!(
-                                "sslmode={v} requires TLS, which altonic does not implement; use sslmode=disable against servers that accept plain TCP"
-                            )));
-                        }
-                    }
-                    "schema" => schema = v,
-                    "password" => password = Some(v),
-                    "connect_timeout" | "application_name" => {}
-                    other => return Err(verr(format!("unsupported URL parameter {other:?}"))),
+        let mut passthrough: Vec<(String, String)> = Vec::new();
+        for (k, v) in pairs {
+            match k.as_str() {
+                "schema" => schema = v,
+                // altonic links no TLS backend, so a mode that mandates TLS
+                // is rejected here rather than failing at connect time.
+                "sslmode" if !matches!(v.as_str(), "disable" | "prefer" | "allow") => {
+                    return Err(verr(format!(
+                        "sslmode={v} requires TLS, which altonic is not built with; \
+                         use sslmode=disable against servers that accept plain TCP"
+                    )))
                 }
+                _ => passthrough.push((k, v)),
             }
         }
-        if password.is_none() {
-            password = std::env::var("PGPASSWORD").ok().filter(|p| !p.is_empty());
+        set_query(&mut url, &passthrough);
+
+        let mut config = Config::from_str(url.as_str())
+            .map_err(|e| verr(format!("bad postgres URL {text:?}: {e}")))?;
+        if config.get_user().is_none() {
+            config.user("postgres");
+        }
+        if config.get_password().is_none() {
+            if let Some(pw) = std::env::var("PGPASSWORD").ok().filter(|p| !p.is_empty()) {
+                config.password(pw);
+            }
         }
 
-        Ok(PgUrl { user, password, host, port, database, schema })
+        // Redacted form: no userinfo password, no `password=` parameter.
+        let mut shown = url.clone();
+        let _ = shown.set_password(None);
+        let kept: Vec<(String, String)> =
+            passthrough.into_iter().filter(|(k, _)| k != "password").collect();
+        set_query(&mut shown, &kept);
+
+        Ok(PgUrl { config, schema, redacted: shown.to_string() })
     }
 
-    pub fn password(&self) -> Result<String> {
-        self.password.clone().ok_or_else(|| {
-            verr("postgres server requires a password; put it in the URL (postgres://user:pass@...) or set PGPASSWORD")
-        })
+    /// Open a connection with the session pinned to UTC, so timestamptz text
+    /// is stable (+00) and shift arithmetic in datetime generators is correct.
+    pub fn connect(&self) -> Result<Client> {
+        let mut client = self
+            .config
+            .connect(NoTls)
+            .map_err(|e| rerr(format!("cannot connect to {}: {e}", self.redacted)))?;
+        client
+            .batch_execute("SET TIME ZONE 'UTC'")
+            .map_err(|e| rerr(format!("postgres: {e}")))?;
+        Ok(client)
     }
 
     /// Redacted form for logs and reports.
-    pub fn redacted(&self) -> String {
-        format!("postgres://{}@{}:{}/{}", self.user, self.host, self.port, self.database)
+    pub fn redacted(&self) -> &str {
+        &self.redacted
+    }
+}
+
+fn set_query(url: &mut url::Url, pairs: &[(String, String)]) {
+    if pairs.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
 }
 
@@ -121,13 +114,13 @@ mod tests {
 
     #[test]
     fn parses_full_url() {
-        let u = PgUrl::parse("postgres://alice:s%40crit@db.example:6432/prod?schema=app&sslmode=disable")
-            .unwrap();
-        assert_eq!(u.user, "alice");
-        assert_eq!(u.password().unwrap(), "s@crit");
-        assert_eq!(u.host, "db.example");
-        assert_eq!(u.port, 6432);
-        assert_eq!(u.database, "prod");
+        let u = PgUrl::parse(
+            "postgres://alice:s%40crit@db.example:6432/prod?schema=app&sslmode=disable",
+        )
+        .unwrap();
+        assert_eq!(u.config.get_user(), Some("alice"));
+        assert_eq!(u.config.get_password(), Some(&b"s@crit"[..]));
+        assert_eq!(u.config.get_dbname(), Some("prod"));
         assert_eq!(u.schema, "app");
         assert!(!u.redacted().contains("crit"));
     }
@@ -135,9 +128,15 @@ mod tests {
     #[test]
     fn defaults() {
         let u = PgUrl::parse("postgresql://localhost/mydb").unwrap();
-        assert_eq!(u.user, "postgres");
-        assert_eq!(u.port, 5432);
+        assert_eq!(u.config.get_user(), Some("postgres"));
         assert_eq!(u.schema, "public");
+    }
+
+    #[test]
+    fn password_parameter_is_redacted() {
+        let u = PgUrl::parse("postgres://bob@h/db?password=hunter2").unwrap();
+        assert_eq!(u.config.get_password(), Some(&b"hunter2"[..]));
+        assert!(!u.redacted().contains("hunter2"), "{}", u.redacted());
     }
 
     #[test]

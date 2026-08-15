@@ -1,119 +1,72 @@
-//! Deterministic PRNG: SplitMix64 seed expansion feeding Xoshiro256**.
+//! Deterministic PRNG: Xoshiro256** from `rand_xoshiro`, sampled through
+//! `rand`/`rand_distr`.
 //!
 //! All generator randomness flows through this type, seeded by HMAC digests
-//! (see SPEC §5.1). Uniform integer sampling uses Lemire's rejection method to
-//! avoid modulo bias; Gaussian uses Box–Muller.
+//! (see SPEC §5.1). Everything is a pure function of the seed — no OS entropy,
+//! no time — which is what makes a masking run reproducible.
+
+use rand::seq::{IndexedRandom, SliceRandom};
+use rand::{Rng as _, RngExt as _, SeedableRng};
+use rand_distr::StandardNormal;
+use rand_xoshiro::Xoshiro256StarStar;
 
 pub struct Rng {
-    s: [u64; 4],
-}
-
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9e3779b97f4a7c15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z ^ (z >> 31)
+    inner: Xoshiro256StarStar,
 }
 
 impl Rng {
     pub fn from_seed(seed: u64) -> Self {
-        let mut sm = seed;
-        let s = [
-            splitmix64(&mut sm),
-            splitmix64(&mut sm),
-            splitmix64(&mut sm),
-            splitmix64(&mut sm),
-        ];
-        Rng { s }
+        Rng { inner: Xoshiro256StarStar::seed_from_u64(seed) }
     }
 
     /// Seed from a 32-byte HMAC digest, using all 256 bits of state.
     pub fn from_digest(d: &[u8; 32]) -> Self {
-        let mut s = [0u64; 4];
-        for i in 0..4 {
-            s[i] = u64::from_be_bytes(d[i * 8..i * 8 + 8].try_into().unwrap());
-        }
-        // Xoshiro must not be seeded all-zero; SplitMix a fallback (unreachable
-        // for HMAC output in practice, but cheap to guard).
-        if s == [0, 0, 0, 0] {
-            return Rng::from_seed(0);
-        }
-        Rng { s }
+        Rng { inner: Xoshiro256StarStar::from_seed(*d) }
     }
 
     pub fn next_u64(&mut self) -> u64 {
-        let result = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
-        let t = self.s[1] << 17;
-        self.s[2] ^= self.s[0];
-        self.s[3] ^= self.s[1];
-        self.s[1] ^= self.s[2];
-        self.s[0] ^= self.s[3];
-        self.s[2] ^= t;
-        self.s[3] = self.s[3].rotate_left(45);
-        result
+        self.inner.next_u64()
     }
 
-    /// Uniform in [0, bound) without modulo bias (Lemire). bound must be > 0.
+    /// Uniform in [0, bound). bound must be > 0.
     pub fn below(&mut self, bound: u64) -> u64 {
         debug_assert!(bound > 0);
-        loop {
-            let x = self.next_u64();
-            let m = (x as u128) * (bound as u128);
-            let lo = m as u64;
-            if lo >= bound || lo >= (u64::MAX - bound + 1) % bound {
-                return (m >> 64) as u64;
-            }
-        }
+        self.inner.random_range(0..bound)
     }
 
     /// Uniform integer in [lo, hi] inclusive.
     pub fn range_i64(&mut self, lo: i64, hi: i64) -> i64 {
         debug_assert!(lo <= hi);
-        let span = (hi as i128 - lo as i128 + 1) as u128;
-        if span > u64::MAX as u128 {
-            // Full-ish i64 span: take a raw u64.
-            return self.next_u64() as i64;
-        }
-        lo.wrapping_add(self.below(span as u64) as i64)
+        self.inner.random_range(lo..=hi)
     }
 
     /// Uniform float in [0, 1) with 53 bits of precision.
     pub fn f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+        self.inner.random()
     }
 
+    /// Uniform float in [lo, hi). Computed from `f64()` rather than sampled
+    /// directly so that an empty range (lo == hi) yields lo instead of panicking.
     pub fn range_f64(&mut self, lo: f64, hi: f64) -> f64 {
         lo + (hi - lo) * self.f64()
     }
 
     pub fn bool(&mut self) -> bool {
-        self.next_u64() & 1 == 1
+        self.inner.random()
     }
 
-    /// Standard normal via Box–Muller.
+    /// Standard normal.
     pub fn gaussian(&mut self) -> f64 {
-        let u1 = loop {
-            let u = self.f64();
-            if u > 0.0 {
-                break u;
-            }
-        };
-        let u2 = self.f64();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        self.inner.sample(StandardNormal)
     }
 
     pub fn choose<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         debug_assert!(!items.is_empty());
-        &items[self.below(items.len() as u64) as usize]
+        items.choose(&mut self.inner).expect("choose from a non-empty slice")
     }
 
-    /// Fisher–Yates shuffle.
     pub fn shuffle<T>(&mut self, items: &mut [T]) {
-        for i in (1..items.len()).rev() {
-            let j = self.below(i as u64 + 1) as usize;
-            items.swap(i, j);
-        }
+        items.shuffle(&mut self.inner);
     }
 }
 
@@ -132,6 +85,32 @@ mod tests {
         assert_ne!(Rng::from_seed(42).next_u64(), c.next_u64());
     }
 
+    fn draws(seed: &[u8; 32]) -> Vec<u64> {
+        let mut r = Rng::from_digest(seed);
+        (0..8).map(|_| r.next_u64()).collect()
+    }
+
+    /// Every byte of the digest has to reach the state — a digest differing in
+    /// one bit must not produce the same stream. (Xoshiro's first output alone
+    /// reflects only one state word, so compare a run of draws.)
+    #[test]
+    fn digest_seeding_uses_the_whole_digest() {
+        let zero = [0u8; 32];
+        for byte in 0..32 {
+            let mut other = zero;
+            other[byte] = 1;
+            assert_ne!(draws(&zero), draws(&other), "byte {byte} did not affect the stream");
+        }
+    }
+
+    /// Xoshiro is stuck at zero if seeded all-zero; the driver remaps that
+    /// seed, and this pins the behaviour we rely on.
+    #[test]
+    fn all_zero_digest_is_not_a_dead_stream() {
+        let stream = draws(&[0u8; 32]);
+        assert!(stream.iter().any(|&v| v != 0), "all-zero seed produced a dead stream");
+    }
+
     #[test]
     fn bounds_respected() {
         let mut r = Rng::from_seed(7);
@@ -143,6 +122,12 @@ mod tests {
             let b = r.below(3);
             assert!(b < 3);
         }
+    }
+
+    #[test]
+    fn degenerate_float_range() {
+        let mut r = Rng::from_seed(3);
+        assert_eq!(r.range_f64(2.5, 2.5), 2.5);
     }
 
     #[test]
