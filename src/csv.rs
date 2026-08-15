@@ -1,5 +1,11 @@
 //! RFC 4180 CSV reader/writer with streaming record iteration.
 //!
+//! This is hand-written rather than the `csv` crate for one reason: the dataset
+//! format distinguishes an empty *unquoted* cell (NULL) from `""` (the empty
+//! string), and no CSV crate reports whether a field was quoted — `csv` decodes
+//! both to the same empty string. Reading NULLs correctly requires the flag, so
+//! the codec stays in-repo.
+//!
 //! Quoted fields may contain commas, quotes (doubled), and newlines. Reader
 //! accepts both \n and \r\n line endings; writer always emits \n and quotes
 //! only when needed. An empty unquoted field is distinguished from a quoted

@@ -10,21 +10,9 @@ use crate::pg::{PgDestination, PgSource, PgUrl};
 use crate::scan;
 use crate::subset::{self, TableRole};
 use crate::{Error, Result};
-use std::collections::HashMap;
+use clap::{Parser, Subcommand};
 
-const USAGE: &str = "altonic — pure-Rust data cleaning, subsetting, and replication
-
-USAGE:
-  altonic init <dir>                          scaffold a demo dataset + config
-  altonic schema   --source <src>             print the source schema
-  altonic scan     --source <src> [--config <file>] [--sample N]
-                   [--json] [--apply <file>] [--strict]
-  altonic check    --source <src> --config <file> [--sample N]
-                   [--json] [--strict]
-  altonic subset   --source <src> --config <file> [--json] [--verify]
-  altonic generate --source <src> --dest <dst> --config <file>
-                   [--no-subset] [--dry-run] [--report <file>] [--json]
-
+const AFTER_HELP: &str = "\
 <src>/<dst> are either dataset directories (schema.json + one CSV per
 table) or live Postgres URLs:
   postgres://user:password@host:5432/dbname[?schema=public]
@@ -32,10 +20,124 @@ Postgres replication preserves the source's exact column types, primary
 keys, unique constraints, and foreign keys in the destination database.
 See SPEC.md for the configuration format and generator catalog.";
 
+/// Rows sampled for PII detection when `--sample` is not given.
+const DEFAULT_SAMPLE: usize = 1000;
+
+#[derive(Parser)]
+#[command(
+    name = "altonic",
+    version,
+    about = "altonic — data cleaning, subsetting, and replication",
+    after_help = AFTER_HELP,
+    subcommand_required = false,
+    arg_required_else_help = false
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Scaffold a demo dataset + config
+    Init {
+        /// Directory to create the workspace in
+        dir: String,
+    },
+    /// Print the source schema
+    Schema {
+        #[arg(long)]
+        source: String,
+    },
+    /// Detect likely-PII columns and recommend generators
+    Scan {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        config: Option<String>,
+        /// Rows to sample per table
+        #[arg(long, default_value_t = DEFAULT_SAMPLE)]
+        sample: usize,
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Write recommendations into this config file
+        #[arg(long)]
+        apply: Option<String>,
+        /// Fail if any likely-PII column has no generator
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Check a config against the source schema
+    Check {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        config: String,
+        #[arg(long, default_value_t = DEFAULT_SAMPLE)]
+        sample: usize,
+        #[arg(long)]
+        json: bool,
+        /// Fail on warnings as well as errors
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Preview the subset a config selects
+    Subset {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        config: String,
+        #[arg(long)]
+        json: bool,
+        /// Check that every selected row's foreign keys resolve
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Mask the source into the destination
+    Generate {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        dest: String,
+        #[arg(long)]
+        config: String,
+        /// Copy every table in full, ignoring the subset configuration
+        #[arg(long = "no-subset")]
+        no_subset: bool,
+        /// Do all the work but write nothing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+        /// Write the run report as JSON to this path
+        #[arg(long)]
+        report: Option<String>,
+    },
+}
+
 /// Entry point; returns the process exit code.
 pub fn run() -> i32 {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match dispatch(&args) {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // --help/--version are a successful request for output, not a
+            // usage error; everything else is a validation failure (exit 1).
+            return match e.kind() {
+                clap::error::ErrorKind::DisplayHelp
+                | clap::error::ErrorKind::DisplayVersion
+                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+                    print!("{e}");
+                    0
+                }
+                _ => {
+                    eprint!("{e}");
+                    1
+                }
+            };
+        }
+    };
+    match dispatch(cli.command) {
         Ok(()) => 0,
         Err(Error::Validation(m)) => {
             eprintln!("error: {m}");
@@ -48,68 +150,29 @@ pub fn run() -> i32 {
     }
 }
 
-struct Flags {
-    positional: Vec<String>,
-    named: HashMap<String, String>,
-    switches: Vec<String>,
-}
-
-fn parse_flags(args: &[String], named_keys: &[&str], switch_keys: &[&str]) -> Result<Flags> {
-    let mut f = Flags { positional: Vec::new(), named: HashMap::new(), switches: Vec::new() };
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if let Some(key) = a.strip_prefix("--") {
-            if switch_keys.contains(&key) {
-                f.switches.push(key.to_string());
-            } else if named_keys.contains(&key) {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| crate::verr(format!("--{key} requires a value")))?;
-                f.named.insert(key.to_string(), v.clone());
-            } else {
-                return Err(crate::verr(format!("unknown flag --{key}")));
-            }
-        } else {
-            f.positional.push(a.clone());
-        }
-        i += 1;
-    }
-    Ok(f)
-}
-
-impl Flags {
-    fn require(&self, key: &str) -> Result<&str> {
-        self.named
-            .get(key)
-            .map(String::as_str)
-            .ok_or_else(|| crate::verr(format!("--{key} is required")))
-    }
-
-    fn has(&self, key: &str) -> bool {
-        self.switches.iter().any(|s| s == key)
-    }
-}
-
-fn dispatch(args: &[String]) -> Result<()> {
-    let Some(cmd) = args.first() else {
-        println!("{USAGE}");
+fn dispatch(command: Option<Command>) -> Result<()> {
+    let Some(command) = command else {
+        // Bare `altonic`: show what it can do rather than an error.
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        cmd.print_help().map_err(|e| crate::rerr(e.to_string()))?;
+        println!();
         return Ok(());
     };
-    let rest = &args[1..];
-    match cmd.as_str() {
-        "init" => cmd_init(rest),
-        "schema" => cmd_schema(rest),
-        "scan" => cmd_scan(rest),
-        "check" => cmd_check(rest),
-        "subset" => cmd_subset(rest),
-        "generate" => cmd_generate(rest),
-        "help" | "--help" | "-h" => {
-            println!("{USAGE}");
-            Ok(())
+    match command {
+        Command::Init { dir } => cmd_init(&dir),
+        Command::Schema { source } => cmd_schema(&source),
+        Command::Scan { source, config, sample, json, apply, strict } => {
+            cmd_scan(&source, config.as_deref(), sample, json, apply.as_deref(), strict)
         }
-        other => Err(crate::verr(format!("unknown command {other:?}; run `altonic help`"))),
+        Command::Check { source, config, sample, json, strict } => {
+            cmd_check(&source, &config, sample, json, strict)
+        }
+        Command::Subset { source, config, json, verify } => {
+            cmd_subset(&source, &config, json, verify)
+        }
+        Command::Generate { source, dest, config, no_subset, dry_run, json, report } => {
+            cmd_generate(&source, &dest, &config, no_subset, dry_run, json, report.as_deref())
+        }
     }
 }
 
@@ -139,9 +202,8 @@ fn open_dest(spec: &str) -> Result<Box<dyn DestinationConnector>> {
 
 // ---------- schema ----------
 
-fn cmd_schema(args: &[String]) -> Result<()> {
-    let f = parse_flags(args, &["source"], &[])?;
-    let ds = open_source(f.require("source")?)?;
+fn cmd_schema(source: &str) -> Result<()> {
+    let ds = open_source(source)?;
     for t in &ds.schema().tables {
         let rows = ds.count_rows(&t.name)?;
         println!("{}  ({} rows)", t.name, rows);
@@ -171,20 +233,22 @@ fn cmd_schema(args: &[String]) -> Result<()> {
 
 // ---------- scan ----------
 
-fn cmd_scan(args: &[String]) -> Result<()> {
-    let f = parse_flags(args, &["source", "config", "sample", "apply"], &["json", "strict"])?;
-    let ds = open_source(f.require("source")?)?;
-    let config = match f.named.get("config") {
+fn cmd_scan(
+    source: &str,
+    config_path: Option<&str>,
+    sample: usize,
+    json: bool,
+    apply: Option<&str>,
+    strict: bool,
+) -> Result<()> {
+    let ds = open_source(source)?;
+    let config = match config_path {
         Some(p) => Some(load_config(p)?),
         None => None,
     };
-    let sample: usize = match f.named.get("sample") {
-        Some(s) => s.parse().map_err(|_| crate::verr("--sample must be a number"))?,
-        None => 1000,
-    };
     let report = scan::scan(ds.as_ref(), config.as_ref(), sample)?;
 
-    if f.has("json") {
+    if json {
         println!("{}", report.to_json().to_string_pretty());
     } else if report.findings.is_empty() {
         println!("No likely-PII columns detected ({} rows sampled).", report.sampled_rows);
@@ -210,7 +274,7 @@ fn cmd_scan(args: &[String]) -> Result<()> {
         }
     }
 
-    if let Some(apply_path) = f.named.get("apply") {
+    if let Some(apply_path) = apply {
         let mut config = if std::path::Path::new(apply_path).exists() {
             load_config(apply_path)?
         } else {
@@ -232,7 +296,7 @@ fn cmd_scan(args: &[String]) -> Result<()> {
         println!("\nApplied {applied} recommendation(s) to {apply_path}");
     }
 
-    if f.has("strict") {
+    if strict {
         let unresolved = scan::unresolved(&report);
         if !unresolved.is_empty() {
             return Err(crate::verr(format!(
@@ -265,19 +329,18 @@ fn fresh_secret() -> String {
 
 // ---------- check ----------
 
-fn cmd_check(args: &[String]) -> Result<()> {
-    let f = parse_flags(args, &["source", "config", "sample"], &["json", "strict"])?;
-    let source_spec = f.require("source")?;
-    let config_path = f.require("config")?;
+fn cmd_check(
+    source_spec: &str,
+    config_path: &str,
+    sample: usize,
+    json: bool,
+    strict: bool,
+) -> Result<()> {
     let ds = open_source(source_spec)?;
     let config = load_config(config_path)?;
-    let sample: usize = match f.named.get("sample") {
-        Some(s) => s.parse().map_err(|_| crate::verr("--sample must be a number"))?,
-        None => 1000,
-    };
     let report = crate::check::check(ds.as_ref(), &config, sample)?;
 
-    if f.has("json") {
+    if json {
         println!("{}", report.to_json().to_string_pretty());
     } else {
         println!("Config {config_path} vs detected schema of {source_spec}\n");
@@ -332,7 +395,7 @@ fn cmd_check(args: &[String]) -> Result<()> {
             report.errors()
         )));
     }
-    if f.has("strict") && report.warnings() > 0 {
+    if strict && report.warnings() > 0 {
         return Err(crate::verr(format!(
             "strict mode: {} warning(s) (unprotected PII or ignored configuration)",
             report.warnings()
@@ -343,22 +406,21 @@ fn cmd_check(args: &[String]) -> Result<()> {
 
 // ---------- subset ----------
 
-fn cmd_subset(args: &[String]) -> Result<()> {
-    let f = parse_flags(args, &["source", "config"], &["json", "verify"])?;
-    let ds = open_source(f.require("source")?)?;
-    let config = load_config(f.require("config")?)?;
+fn cmd_subset(source: &str, config_path: &str, json: bool, verify: bool) -> Result<()> {
+    let ds = open_source(source)?;
+    let config = load_config(config_path)?;
     let sc = config
         .subset
         .as_ref()
         .ok_or_else(|| crate::verr("config has no \"subset\" section"))?;
     let result = subset::compute(ds.as_ref(), sc, config.secret.as_bytes())?;
-    if f.has("verify") {
+    if verify {
         subset::verify_closure(ds.as_ref(), &result)?;
     }
 
     let mut names: Vec<&String> = result.tables.keys().collect();
     names.sort();
-    if f.has("json") {
+    if json {
         let mut members = Vec::new();
         for name in names {
             let ts = &result.tables[name];
@@ -386,7 +448,7 @@ fn cmd_subset(args: &[String]) -> Result<()> {
                 pct
             );
         }
-        if f.has("verify") {
+        if verify {
             println!("\nClosure verified: every included row's foreign keys resolve in the subset.");
         }
     }
@@ -395,25 +457,22 @@ fn cmd_subset(args: &[String]) -> Result<()> {
 
 // ---------- generate ----------
 
-fn cmd_generate(args: &[String]) -> Result<()> {
-    let f = parse_flags(
-        args,
-        &["source", "dest", "config", "report"],
-        &["no-subset", "dry-run", "json"],
-    )?;
-    let source_path = f.require("source")?;
-    let dest_path = f.require("dest")?;
-    let config_path = f.require("config")?;
+fn cmd_generate(
+    source_path: &str,
+    dest_path: &str,
+    config_path: &str,
+    no_subset: bool,
+    dry_run: bool,
+    json: bool,
+    report_path: Option<&str>,
+) -> Result<()> {
     let ds = open_source(source_path)?;
     let config = load_config(config_path)?;
     let mut dest = open_dest(dest_path)?;
-    let options = GenerateOptions {
-        use_subset: !f.has("no-subset"),
-        dry_run: f.has("dry-run"),
-    };
+    let options = GenerateOptions { use_subset: !no_subset, dry_run };
     let report = engine::generate(ds.as_ref(), dest.as_mut(), &config, &options)?;
 
-    if f.has("json") {
+    if json {
         println!("{}", report.to_json().to_string_pretty());
     } else {
         println!(
@@ -433,7 +492,7 @@ fn cmd_generate(args: &[String]) -> Result<()> {
         let action = if options.dry_run { "Dry run finished" } else { "Generation finished" };
         println!("\n{action} in {} ms; destination: {dest_path}", report.elapsed_ms);
     }
-    if let Some(path) = f.named.get("report") {
+    if let Some(path) = report_path {
         std::fs::write(path, report.to_json().to_string_pretty())
             .map_err(|e| crate::rerr(format!("cannot write {path}: {e}")))?;
     }
@@ -442,12 +501,7 @@ fn cmd_generate(args: &[String]) -> Result<()> {
 
 // ---------- init ----------
 
-fn cmd_init(args: &[String]) -> Result<()> {
-    let f = parse_flags(args, &[], &[])?;
-    let dir = f
-        .positional
-        .first()
-        .ok_or_else(|| crate::verr("usage: altonic init <dir>"))?;
+fn cmd_init(dir: &str) -> Result<()> {
     let root = std::path::Path::new(dir);
     let source = root.join("source");
     if source.exists() {
@@ -695,3 +749,50 @@ percent = 50.0
 [[subset.upstream]]
 table = "order_items"
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// clap's own consistency check over the command tree.
+    #[test]
+    fn command_tree_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// The flag names are the user-facing contract; pin them.
+    #[test]
+    fn generate_flags() {
+        let cli = Cli::try_parse_from([
+            "altonic", "generate", "--source", "s", "--dest", "d", "--config", "c", "--no-subset",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Some(Command::Generate { source, dest, config, no_subset, dry_run, report, json }) =
+            cli.command
+        else {
+            panic!("expected the generate subcommand");
+        };
+        assert_eq!((source.as_str(), dest.as_str(), config.as_str()), ("s", "d", "c"));
+        assert!(no_subset && dry_run);
+        assert!(report.is_none() && !json);
+    }
+
+    #[test]
+    fn sample_defaults_and_parses() {
+        let default = Cli::try_parse_from(["altonic", "scan", "--source", "s"]).unwrap();
+        assert!(matches!(default.command, Some(Command::Scan { sample, .. }) if sample == DEFAULT_SAMPLE));
+        let zero =
+            Cli::try_parse_from(["altonic", "scan", "--source", "s", "--sample", "0"]).unwrap();
+        assert!(matches!(zero.command, Some(Command::Scan { sample: 0, .. })));
+        assert!(Cli::try_parse_from(["altonic", "scan", "--source", "s", "--sample", "x"]).is_err());
+    }
+
+    #[test]
+    fn required_flags_are_enforced() {
+        assert!(Cli::try_parse_from(["altonic", "generate", "--source", "s"]).is_err());
+        assert!(Cli::try_parse_from(["altonic", "schema"]).is_err());
+        assert!(Cli::try_parse_from(["altonic", "scan", "--source", "s", "--bogus"]).is_err());
+    }
+}

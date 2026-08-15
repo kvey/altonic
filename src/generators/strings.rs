@@ -1,13 +1,13 @@
 //! String, categorical, and miscellaneous value generators (SPEC §6).
 
-use super::{require_type, CellCtx, ColumnStats, Generator, Opts};
+use super::{compile, require_type, CellCtx, ColumnStats, Generator, Opts};
 use crate::crypto;
 use crate::json::Json;
-use crate::regex::{replace_all, Regex};
 use crate::rng::Rng;
 use crate::schema::Column;
 use crate::value::{ColumnType, Value};
 use crate::{verr, Result};
+use regex::Regex;
 
 // ---- categorical: redraw from the column's own distribution ----
 
@@ -274,7 +274,7 @@ impl Generator for FindAndReplace {
             other => other.to_string(),
         };
         Ok(Value::Text(match &self.regex {
-            Some(re) => replace_all(re, &s, &self.replace),
+            Some(re) => re.replace_all(&s, self.replace.as_str()).into_owned(),
             None => s.replace(&self.find, &self.replace),
         }))
     }
@@ -288,7 +288,11 @@ pub fn find_and_replace(opts: &Opts, column: &Column) -> Result<Box<dyn Generato
         .ok_or_else(|| verr("generator \"find_and_replace\": option \"find\" is required"))?
         .to_string();
     let replace = opts.str_or("replace", "")?.to_string();
-    let regex = if opts.bool_or("regex", false)? { Some(Regex::new(&find)?) } else { None };
+    let regex = if opts.bool_or("regex", false)? {
+        Some(compile("find_and_replace", &find)?)
+    } else {
+        None
+    };
     Ok(Box::new(FindAndReplace { regex, find, replace }))
 }
 

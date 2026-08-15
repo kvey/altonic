@@ -23,6 +23,14 @@ pub use info::luhn_valid;
 use crate::json::Json;
 use crate::rng::Rng;
 use crate::schema::{Column, Table};
+
+/// Compile a user-supplied pattern, reporting the failure against the
+/// generator that asked for it. The `regex` crate's message already carries
+/// the offending position.
+fn compile(generator: &str, pattern: &str) -> Result<regex::Regex> {
+    regex::Regex::new(pattern)
+        .map_err(|e| verr(format!("generator {generator:?}: invalid regex {pattern:?}: {e}")))
+}
 use crate::value::{ColumnType, Row, Value};
 use crate::{verr, Result};
 

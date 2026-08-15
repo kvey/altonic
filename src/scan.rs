@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::connector::SourceConnector;
 use crate::generators::{luhn_valid, FIRST_NAMES, GENERATOR_NAMES, LAST_NAMES};
 use crate::json::Json;
-use crate::regex::Regex;
+use regex::Regex;
 use crate::schema::Table;
 use crate::value::{ColumnType, Value};
 use crate::Result;
