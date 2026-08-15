@@ -1,0 +1,19 @@
+[package]
+name = "altonic"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust database data cleaning (de-identification), subsetting, and replication tool"
+license = "MIT"
+
+[dependencies]
+
+[lib]
+name = "altonic"
+path = "src/lib.rs"
+
+[[bin]]
+name = "altonic"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
